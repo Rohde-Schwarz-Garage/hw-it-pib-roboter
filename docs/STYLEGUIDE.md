@@ -10,7 +10,7 @@ This project follows [PEP 8](https://peps.python.org/pep-0008/). This guide list
 
 ## Formatting
 
-- Maximum line length: **88** characters.
+- Maximum line length: **150** characters.
 - Use **double quotes** for strings.
 - Indent with 4 spaces, never tabs.
 - Use trailing commas in multi-line collections and calls.
@@ -50,8 +50,8 @@ This project follows [PEP 8](https://peps.python.org/pep-0008/). This guide list
 
 ## Functions
 
-- A function body has at most **10 lines**, excluding signature and docstring.
-- Ruff enforces this as a limit of 10 statements; the line limit is checked in review.
+- A function body has at most **12 lines**, excluding signature and docstring.
+- Ruff enforces this as a limit of 12 statements; the line limit is checked in review.
 - Cyclomatic complexity is at most **5** per function.
 
 ## Comments

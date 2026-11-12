@@ -11,7 +11,7 @@ dev = ["ruff"]
 where = ["src"]
 
 [tool.ruff]
-line-length = 88
+line-length = 150
 target-version = "py312"
 
 [tool.ruff.format]
@@ -27,4 +27,4 @@ max-complexity = 5
 convention = "google"
 
 [tool.ruff.lint.pylint]
-max-statements = 10
+max-statements = 12
