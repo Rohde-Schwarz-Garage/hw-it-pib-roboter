@@ -1,3 +1,44 @@
+# pib Robot
+
+Repair and extension of a pib robot with a unified programming interface.
+
+## 🎯 Project Goal
+
+The goal is a humanoid robot that can interact with people through speech, movements, and audiovisual output. A central control system and a Python interface are intended to enable the development of custom applications.
+
+## ⚙️ Planned Features
+
+- **Movement:** Control servos for gestures and other movement sequences precisely.
+- **Interaction:** Capture and respond to input via buttons and speech.
+- **Audio:** Process and output speech and other sounds using a microphone and speakers, respectively.
+- **Display:** Show information and visual content on the screen.
+- **Extensions:** Integrate camera functions and optional external AI services in the future.
+
+## 📋 Project Status
+
+- **Repair:** Repairs and basic functional tests of the robot have been carried out.
+- **API:** Planning and implementation of the new interface are underway.
+- **Evaluation:** Available interfaces and device capabilities are being examined on the robot.
+
+## 🏗️ Planned Architecture
+
+- **Control service:** A central service consolidates access to the hardware.
+- **Applications:** A Python library and, in the future, a web interface use the central control system.
+- **Hardware integration:** ROS 2 is planned for servos and buttons; audio and camera are to be connected via available robot interfaces.
+- **Development:** The control system should be testable without hardware and extensible with additional functionality.
+
+## 🔒 Safety
+
+- **Protective measures:** Movement limits, a central software stop, and securing network access are planned.
+- **Hardware tests:** Tests are conducted under supervision. A software stop is no substitute for hardware safety measures.
+- **Privacy:** Audio and image data should only be transmitted externally with explicit consent.
+
+## 🔗 Official Information on pib 4 Advanced
+- [Download overview for pib 4 Advanced](https://files.pib.rocks/v4/advanced/)
+
+
+
+# German Version
 # pib-Roboter
 
 Instandsetzung und Erweiterung eines pib-Roboters mit einer einheitlichen Programmierschnittstelle.
