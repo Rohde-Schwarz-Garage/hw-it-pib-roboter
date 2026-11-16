@@ -1,0 +1,1 @@
+"""Speaker output adapter."""
