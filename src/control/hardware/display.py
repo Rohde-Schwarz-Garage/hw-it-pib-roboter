@@ -1,0 +1,1 @@
+"""Screen output adapter."""
