@@ -200,7 +200,7 @@ class ServoController:
         ImportError: A required ROS package is missing (at module import).
     """
 
-    def __init__(self, *, timeout_s: float = 2.0, max_age_s: float = 1.0) -> None:
+    def __init__(self, *, timeout_s: float = 4.0, max_age_s: float = 1.0) -> None:
         """Create a private ROS context; do not send commands or enable power."""
         self._timeout_s = _positive(timeout_s, "timeout_s")
         self._max_age_s = _positive(max_age_s, "max_age_s")
