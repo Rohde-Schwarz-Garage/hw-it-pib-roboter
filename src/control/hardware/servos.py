@@ -24,6 +24,8 @@ Safety:
     loader can use the setters. Cerebra seed limits are deliberately not used.
     Limits do not guarantee collision avoidance. No relay, torque or speed
     settings are changed. Closing the adapter is NOT an emergency stop.
+    Current diagnostics at WARN level are logged as errors; they do not stop
+    motors. Warnings require a running controller and current publisher.
     A successful move means backend acceptance, NOT arrival at the target.
     A timeout cannot undo a command already received; never blindly retry it.
 
@@ -32,28 +34,34 @@ ROS contract:
     with all joints in ONE JointTrajectoryPoint, positions in radians.
     Feedback uses /joint_states (sensor_msgs/msg/JointState), also in radians.
     /motor_current uses diagnostic_msgs/msg/DiagnosticStatus: name is the ROS
-    motor name, values contains a matching key with a numeric mA string.
+    motor name, values contains a matching key with a numeric current string.
+    The API returns its magnitude, nominally mA; for Feetech servos the backend
+    publishes the signed raw register value x 10, which is unverified as mA.
     This layout follows pib-rocks/pib-backend develop, motor_current.py.
     Except for /joint_states, these interfaces still require confirmation
     on the robot.
 
 Execution:
-    The controller owns an independent ROS context, node and executor. Calls
-    are synchronous and serialized; callbacks run only while reading or moving.
-    Do not call this blocking API from ROS callbacks. Feedback expires after
-    max_age_s measured from local receipt, not the physical sampling time;
-    queued DDS messages can be older. Missing/stale feedback raises TimeoutError,
-    never a fabricated zero. There is no service-position fallback.
+    The controller owns an independent ROS context, node and background executor.
+    Calls are synchronous; commands are serialized, feedback reads wait in parallel.
+    Do not call this blocking API from ROS
+    callbacks. Feedback expires after max_age_s measured from local callback
+    processing, not the physical sampling time; queued DDS or backend-cached
+    messages can be older. Partial joint messages update only included joints.
+    Missing/stale feedback raises TimeoutError, never a fabricated zero.
+    There is no service-position fallback.
     Finger groups expand to the five stretch joints, excluding opposition.
     Read individual fingers for positions/currents; groups have no single value.
 """
 
 from __future__ import annotations
 
+import atexit
 from collections.abc import Mapping
 from contextlib import ExitStack
 from math import degrees, isfinite, radians
-from threading import RLock
+from numbers import Real
+from threading import Condition, Event, RLock, Thread
 from time import monotonic
 from types import MappingProxyType, TracebackType
 
@@ -63,6 +71,7 @@ from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.task import Future
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectoryPoint
 
@@ -105,6 +114,7 @@ SERVO_GROUPS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 
 
 _MOVE_TIMEOUT = "ROS operation timed out; a submitted move may still execute."
+_CURRENT_WARNING_INTERVAL_S = 30.0
 
 
 class ServoError(RuntimeError):
@@ -113,7 +123,7 @@ class ServoError(RuntimeError):
 
 def _finite(value: float, label: str) -> float:
     """Reject booleans, non-numbers and non-finite numeric values."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{label} must be a finite number.")
     try:
         result = float(value)
@@ -155,7 +165,7 @@ class Servo:
         return self._controller._get_feedback(self._name, current=False)
 
     def get_current(self) -> float:
-        """Return fresh measured milliamperes, or raise TimeoutError; groups cannot be read."""
+        """Return fresh backend-reported current magnitude (nominally mA), or raise TimeoutError; groups cannot be read."""
         return self._controller._get_feedback(self._name, current=True)
 
     def get_limits(self) -> tuple[float, float] | None:
@@ -167,8 +177,11 @@ class Servo:
         return self._controller._get_limits(self._name)
 
     def set_limits(self, min_deg: float, max_deg: float) -> None:
-        """Set measured inclusive degree limits in memory; groups update all members.
+        """Set measured inclusive degree limits in memory.
 
+        A servo's limits are replaced. A group never widens member limits: each
+        member keeps the intersection with its existing limits; if any member
+        has no overlap, ValueError is raised and nothing changes.
         Reject inverted/non-finite limits. This neither moves motors nor changes
         backend settings. The caller must supply physically verified limits.
         """
@@ -191,15 +204,27 @@ class ServoController:
         """Create a private ROS context; do not send commands or enable power."""
         self._timeout_s = _positive(timeout_s, "timeout_s")
         self._max_age_s = _positive(max_age_s, "max_age_s")
+        self._init_state()
+        with ExitStack() as resources:
+            self._open_ros(resources)
+            self._subscribe()
+            self._start_executor()
+            self._resources = resources.pop_all()
+        # The executor thread is a daemon, so release ROS cleanly at exit if close() was never called.
+        atexit.register(self.close)
+
+    def _init_state(self) -> None:
+        """Initialize synchronization and feedback state before starting ROS."""
         self._lock = RLock()
+        self._feedback_changed = Condition()
+        self._stopping = Event()
+        self._thread: Thread | None = None
+        self._executor_error: Exception | None = None
         self._closed = False
         self._limits: dict[str, tuple[float, float]] = {}
         self._positions: dict[str, tuple[float, float]] = {}
         self._currents: dict[str, tuple[float, float]] = {}
-        with ExitStack() as resources:
-            self._open_ros(resources)
-            self._subscribe()
-            self._resources = resources.pop_all()
+        self._current_warnings: dict[str, float] = {}
 
     def _open_ros(self, resources: ExitStack) -> None:
         """Create ROS resources and register their cleanup."""
@@ -209,7 +234,7 @@ class ServoController:
         self._node = Node("pib_servo_adapter", context=self._context, use_global_arguments=False)
         resources.callback(self._node.destroy_node)
         self._executor = SingleThreadedExecutor(context=self._context)
-        resources.callback(self._executor.shutdown)
+        resources.callback(self._stop_executor)
         self._executor.add_node(self._node)
         self._client = self._node.create_client(ApplyJointTrajectory, "/apply_joint_trajectory")
 
@@ -219,6 +244,37 @@ class ServoController:
         # Current is published per motor in bursts; retain more than one full cycle.
         current_qos = QoSProfile(depth=2 * len(SERVO_NAMES), reliability=ReliabilityPolicy.BEST_EFFORT)
         self._node.create_subscription(DiagnosticStatus, "/motor_current", self._on_current, current_qos)
+
+    def _start_executor(self) -> None:
+        """Start the only thread that processes this executor's callbacks."""
+        # Non-daemon threads are joined before atexit handlers run, which would hang an unclosed process.
+        thread = Thread(target=self._run_executor, name="pib-servo-executor", daemon=True)
+        thread.start()
+        self._thread = thread
+
+    def _run_executor(self) -> None:
+        """Surface executor failures to waiting and future API calls."""
+        try:
+            self._executor.spin()
+        except Exception as error:
+            self._executor_failed(error)
+        else:
+            if not self._stopping.is_set():
+                self._executor_failed(RuntimeError("ROS executor stopped unexpectedly."))
+
+    def _executor_failed(self, error: Exception) -> None:
+        """Report a background failure and wake feedback waiters."""
+        with self._feedback_changed:
+            self._executor_error = error
+            self._feedback_changed.notify_all()
+        self._node.get_logger().error(f"Servo ROS executor failed: {error}")
+
+    def _stop_executor(self) -> None:
+        """Stop the executor and join its thread before destroying the node."""
+        self._stopping.set()
+        self._executor.shutdown()
+        if self._thread is not None:
+            self._thread.join()
 
     def __enter__(self) -> ServoController:
         """Return this open controller for use in a with statement."""
@@ -240,12 +296,19 @@ class ServoController:
         with self._lock:
             if not self._closed:
                 self._closed = True
+                atexit.unregister(self.close)
                 self._resources.close()
+            # Waiting readers do not hold the lock; wake them so they fail immediately.
+            with self._feedback_changed:
+                self._feedback_changed.notify_all()
 
     def _ensure_open(self) -> None:
         """Raise ServoError if the controller or ROS context is closed."""
         if self._closed or not self._context.ok():
             raise ServoError("The servo controller is closed or its ROS context has stopped.")
+        with self._feedback_changed:
+            if self._executor_error is not None:
+                raise ServoError("The servo ROS executor failed.") from self._executor_error
 
     @staticmethod
     def _targets(name: str) -> tuple[str, ...]:
@@ -257,15 +320,31 @@ class ServoController:
         return (name,)
 
     def _set_limits(self, name: str, min_deg: float, max_deg: float) -> None:
-        """Validate and store degree limits for all named targets."""
+        """Validate and store degree limits; groups only narrow member limits, atomically."""
         lower = _finite(min_deg, "min_deg")
         upper = _finite(max_deg, "max_deg")
         if lower > upper:
             raise ValueError("min_deg must not exceed max_deg.")
         with self._lock:
             self._ensure_open()
-            for target in self._targets(name):
-                self._limits[target] = (lower, upper)
+            self._limits.update(self._limit_updates(name, lower, upper))
+
+    def _limit_updates(self, name: str, lower: float, upper: float) -> dict[str, tuple[float, float]]:
+        """Compute all new limits before storing any, so a rejected group update changes nothing."""
+        targets = self._targets(name)
+        if name not in SERVO_GROUPS:
+            return {name: (lower, upper)}
+        return {target: self._narrowed(target, lower, upper) for target in targets}
+
+    def _narrowed(self, target: str, lower: float, upper: float) -> tuple[float, float]:
+        """Intersect new group limits with a member's existing limits so a group never widens them."""
+        existing = self._limits.get(target)
+        if existing is None:
+            return lower, upper
+        narrowed = (max(lower, existing[0]), min(upper, existing[1]))
+        if narrowed[0] > narrowed[1]:
+            raise ValueError(f"{target}: limits {(lower, upper)} do not overlap existing limits {existing}.")
+        return narrowed
 
     def _get_limits(self, name: str) -> tuple[float, float] | None:
         """Return the common degree limits, or None if any are unset."""
@@ -308,14 +387,18 @@ class ServoController:
             raise ValueError("At least one target is required.")
         expanded: dict[str, float] = {}
         for name, angle in targets_deg.items():
-            physical = self._targets(name)
-            value = _finite(angle, f"{name} angle_deg")
-            for target in physical:
-                if target in expanded:
-                    raise ValueError(f"Overlapping targets for {target!r}.")
-                self._validate_target(target, value)
-                expanded[target] = value
+            self._expand_one(expanded, name, angle)
         return expanded
+
+    def _expand_one(self, expanded: dict[str, float], name: str, angle: float) -> None:
+        """Add one servo or group to a batch after checking its members."""
+        physical = self._targets(name)
+        value = _finite(angle, f"{name} angle_deg")
+        for target in physical:
+            if target in expanded:
+                raise ValueError(f"Overlapping targets for {target!r}.")
+            self._validate_target(target, value)
+            expanded[target] = value
 
     def _validate_target(self, name: str, angle_deg: float) -> None:
         """Reject targets without configured limits or outside their range."""
@@ -339,14 +422,28 @@ class ServoController:
         """Submit a trajectory and validate its response within the timeout."""
         deadline = monotonic() + self._timeout_s
         self._wait_for_service(deadline)
+        self._ensure_open()
         future = self._client.call_async(request)
         try:
-            while not future.done():
-                self._spin(deadline, _MOVE_TIMEOUT)
+            self._wait_for_response(future, deadline)
             self._check_response(future.result(), request.joint_trajectory.joint_names)
         finally:
             if not future.done():
                 future.cancel()
+
+    def _notify_waiters(self, _future: Future) -> None:
+        """Wake a thread waiting for the service response as soon as it arrives."""
+        with self._feedback_changed:
+            self._feedback_changed.notify_all()
+
+    def _wait_for_response(self, future: Future, deadline: float) -> None:
+        """Wait for a service response while the executor runs in the background."""
+        future.add_done_callback(self._notify_waiters)
+        with self._feedback_changed:
+            while not future.done():
+                self._ensure_open()
+                self._feedback_changed.wait(timeout=min(0.1, self._remaining(deadline, _MOVE_TIMEOUT)))
+        self._ensure_open()
 
     def _wait_for_service(self, deadline: float) -> None:
         """Wait for the trajectory service within the remaining timeout."""
@@ -361,6 +458,11 @@ class ServoController:
         failures = [f"{result.motor_name}: {result.error_code} {result.detail}" for result in response.results if not result.successful]
         if not response.successful or failures:
             raise ServoError(f"Trajectory rejected (partial execution possible): {'; '.join(failures) or 'unspecified backend error'}")
+        ServoController._check_result_names(response, expected)
+
+    @staticmethod
+    def _check_result_names(response: ApplyJointTrajectory.Response, expected: list[str]) -> None:
+        """Verify that every requested motor has exactly one result."""
         names = [result.motor_name for result in response.results]
         reported = set(names)
         unexpected = reported - set(expected)
@@ -378,49 +480,44 @@ class ServoController:
             raise TimeoutError(message)
         return remaining
 
-    def _spin(self, deadline: float, message: str) -> None:
-        """Process ROS callbacks without exceeding the remaining wait."""
-        self._ensure_open()
-        self._executor.spin_once(timeout_sec=min(0.1, self._remaining(deadline, message)))
-
     def _get_feedback(self, name: str, *, current: bool) -> float:
-        """Read fresh current or position feedback for one physical servo."""
+        """Read fresh current or position feedback for one physical servo.
+
+        The wait runs outside the command lock, so a slow read never delays moves or close().
+        """
         with self._lock:
             self._ensure_open()
             self._targets(name)
             if name in SERVO_GROUPS:
                 raise ValueError("Finger groups have no single measurement; read individual fingers.")
-            cache = self._currents if current else self._positions
-            return self._wait_feedback(cache, SERVO_NAMES[name])
-
-    def _drain(self) -> None:
-        """Process already queued callbacks without waiting."""
-        for _ in range(2 * len(SERVO_NAMES) + qos_profile_sensor_data.depth):
-            self._executor.spin_once(timeout_sec=0)
+        cache = self._currents if current else self._positions
+        return self._wait_feedback(cache, SERVO_NAMES[name])
 
     def _wait_feedback(self, cache: dict[str, tuple[float, float]], motor_name: str) -> float:
-        """Wait for a fresh cached measurement or raise TimeoutError."""
+        """Wait for recently processed feedback or raise TimeoutError."""
+        # TODO: Detect queued or backend-cached old measurements; receipt time alone cannot establish freshness.
         deadline = monotonic() + self._timeout_s
         message = f"No fresh feedback for {motor_name!r}; check motor power and ROS publishers."
-        self._drain()
-        while True:
-            sample = cache.get(motor_name)
-            if sample is not None and monotonic() - sample[1] <= self._max_age_s:
-                return sample[0]
-            if monotonic() >= deadline:
-                raise TimeoutError(message)
-            self._spin(deadline, message)
+        with self._feedback_changed:
+            while True:
+                self._ensure_open()
+                sample = cache.get(motor_name)
+                if sample is not None and monotonic() - sample[1] <= self._max_age_s:
+                    return sample[0]
+                self._feedback_changed.wait(timeout=self._remaining(deadline, message))
 
     def _on_positions(self, message: JointState) -> None:
         """Validate incoming joint states and update position feedback."""
-        if len(message.name) != len(message.position) or len(set(message.name)) != len(message.name):
-            self._positions.clear()
-            self._node.get_logger().error("Invalid /joint_states: duplicate names or mismatched position count.")
-            return
-        received = monotonic()
-        for name, angle_rad in zip(message.name, message.position, strict=True):
-            if name in SERVO_NAMES.values():
-                self._store_position(name, angle_rad, received)
+        with self._feedback_changed:
+            if len(message.name) != len(message.position) or len(set(message.name)) != len(message.name):
+                self._positions.clear()
+                self._node.get_logger().error("Invalid /joint_states: duplicate names or mismatched position count.")
+            else:
+                received = monotonic()
+                for name, angle_rad in zip(message.name, message.position, strict=True):
+                    if name in SERVO_NAMES.values():
+                        self._store_position(name, angle_rad, received)
+            self._feedback_changed.notify_all()
 
     def _store_position(self, name: str, angle_rad: float, received: float) -> None:
         """Cache a position in degrees or invalidate non-finite feedback."""
@@ -435,13 +532,31 @@ class ServoController:
         """Cache valid motor current and log invalid feedback."""
         if message.name not in SERVO_NAMES.values():
             return
-        self._currents.pop(message.name, None)
-        try:
-            value = self._parse_current(message)
-        except ValueError as error:
-            self._node.get_logger().error(f"Invalid current feedback for {message.name!r}: {error}")
+        with self._feedback_changed:
+            self._currents.pop(message.name, None)
+            try:
+                value = self._parse_current(message)
+            except ValueError as error:
+                self._node.get_logger().error(f"Invalid current feedback for {message.name!r}: {error}")
+            else:
+                self._store_current(message, value)
+            self._feedback_changed.notify_all()
+
+    def _store_current(self, message: DiagnosticStatus, value: float) -> None:
+        """Cache valid current and report diagnostic warnings."""
+        received = monotonic()
+        self._currents[message.name] = (value, received)
+        self._warn_current(message, value, received)
+
+    def _warn_current(self, message: DiagnosticStatus, current_ma: float, received: float) -> None:
+        """Log WARN diagnostics per motor without stopping or blocking movement."""
+        if self._level_code(message.level) != self._level_code(DiagnosticStatus.WARN):
+            self._current_warnings.pop(message.name, None)
             return
-        self._currents[message.name] = (value, monotonic())
+        previous = self._current_warnings.get(message.name)
+        if previous is None or received - previous >= _CURRENT_WARNING_INTERVAL_S:
+            self._node.get_logger().error(f"Motor current warning for {message.name!r}: {current_ma} mA. {message.message}")
+            self._current_warnings[message.name] = received
 
     @staticmethod
     def _level_code(level: object) -> int:
@@ -454,13 +569,10 @@ class ServoController:
 
     @staticmethod
     def _parse_current(message: DiagnosticStatus) -> float:
-        """Extract a finite, non-negative current in milliamperes."""
+        """Extract the finite current magnitude; the sign only encodes direction."""
         if ServoController._level_code(message.level) >= ServoController._level_code(DiagnosticStatus.ERROR):
             raise ValueError(f"Diagnostic level {message.level}: {message.message}")
         values = [entry.value for entry in message.values if entry.key == message.name]
         if len(values) != 1:
             raise ValueError("Expected exactly one current entry keyed by the ROS motor name.")
-        current_ma = _finite(float(values[0]), "current_ma")
-        if current_ma < 0:
-            raise ValueError("Negative current is invalid or an unavailable-reading sentinel.")
-        return current_ma
+        return abs(_finite(float(values[0]), "current_ma"))
