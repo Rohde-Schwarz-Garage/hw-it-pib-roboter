@@ -134,6 +134,8 @@ services:
       - all
     depends_on:
       - ros-motors
+    networks:
+      - pib-network
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
