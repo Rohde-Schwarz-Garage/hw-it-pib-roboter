@@ -7,6 +7,7 @@ Install Python 3.12 or newer, then create and activate a virtual environment and
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
+git submodule update --init
 pip install -e '.[dev]'
 ```
 
