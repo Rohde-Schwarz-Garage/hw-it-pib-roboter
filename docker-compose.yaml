@@ -134,6 +134,8 @@ services:
       - all
     depends_on:
       - ros-motors
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   programs:

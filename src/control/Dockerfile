@@ -8,6 +8,7 @@ SHELL ["/bin/bash", "-c"]
 RUN apt-get update && \
     apt-get full-upgrade -y && \
     rosdep update --rosdistro $ROS_DISTRO && \
+    apt-get install python3-pip && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -16,6 +17,8 @@ COPY pib-backend/ros_packages/datatypes /opt/pib-datatypes
 RUN source /opt/ros/$ROS_DISTRO/setup.bash && \
     cd /opt/pib-datatypes && \
     colcon build
+
+RUN pip install tinkerforge --break-system-packages
 
 COPY src/control /control/
 
