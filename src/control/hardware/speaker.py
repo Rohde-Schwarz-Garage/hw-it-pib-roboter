@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import shutil
 import socket
 import struct
@@ -292,11 +293,18 @@ def _communicate_synthesis(process: subprocess.Popen[bytes], data: bytes, cancel
 
 
 def _cleanup_synthesis(process: subprocess.Popen[bytes]) -> None:
-    """Kill and reap a synthesis process which has not exited."""
+    """Stop the synthesis process tree and reap it within a bounded cleanup period."""
     try:
-        if process.poll() is None:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        elif process.poll() is None:
             process.kill()
-            process.communicate()
+        process.communicate(timeout=STOP_TIMEOUT_S)
+    except subprocess.TimeoutExpired as err:
+        raise _SynthesisCleanupError("Speech engine cleanup timed out.") from err
     except (OSError, ValueError, subprocess.SubprocessError) as err:
         raise _SynthesisCleanupError("Could not stop speech engine process.") from err
 
@@ -316,7 +324,13 @@ def _synthesis_process(command: list[str], data: bytes, cancel: Event | None) ->
     _check_synthesis_cancel(cancel)
     deadline = monotonic() + SYNTHESIS_TIMEOUT_S
     try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
+        )
         try:
             return _synthesis_result(process, data, cancel, deadline)
         finally:
@@ -523,11 +537,11 @@ def _terminate(process: subprocess.Popen[bytes]) -> None:
         raise AudioDeviceError("Could not stop audio player.") from err
 
 
-def _write_clip(process: subprocess.Popen[bytes], clip: AudioClip) -> None:
-    """Pipe WAV bytes into the player process and require a zero exit status."""
+def _write_clip(process: subprocess.Popen[bytes], payload: bytes) -> None:
+    """Pipe the audio payload into the player and require a zero exit status."""
     try:
         with process:
-            process.communicate(clip.wav_bytes)
+            process.communicate(payload)
             if process.returncode:
                 raise subprocess.CalledProcessError(process.returncode, process.args)
     except (OSError, ValueError, subprocess.SubprocessError) as err:
@@ -535,13 +549,20 @@ def _write_clip(process: subprocess.Popen[bytes], clip: AudioClip) -> None:
 
 
 class SubprocessPlayer:
-    """Play WAV data synchronously via a local player process such as aplay."""
+    """Play clips synchronously on the default PipeWire output."""
 
-    def __init__(self, command: str | list[str] | tuple[str, ...] = "aplay") -> None:
-        """Configure the player executable and optional fixed arguments, e.g. ``["aplay", "-D", "plughw:1"]``."""
-        self._command: tuple[str, ...] = _normalize_command(command)
+    def __init__(self, command: str | list[str] | tuple[str, ...] | None = None) -> None:
+        """Use PipeWire by default; an explicit command receives complete WAV data on stdin."""
+        self._command: tuple[str, ...] | None = None if command is None else _normalize_command(command)
         self._lock: Lock = Lock()
         self._active: _ActivePlayback | None = None
+
+    def _player_input(self, clip: AudioClip) -> tuple[tuple[str, ...], bytes]:
+        """Send headerless samples to pw-play with the clip's actual timing and channel count."""
+        if self._command is not None:
+            return self._command, clip.wav_bytes
+        channels, rate, frames = _read_pcm(clip.wav_bytes)
+        return ("pw-play", "--raw", "--format=s16", f"--rate={rate}", f"--channels={channels}", "-"), frames
 
     def _stop_locked(self) -> None:
         """Stop and reap the active child process while holding the lock."""
@@ -555,7 +576,7 @@ class SubprocessPlayer:
                 raise
             self._active = None
 
-    def _start(self, cancel: Event | None) -> _ActivePlayback | None:
+    def _start(self, command: tuple[str, ...], cancel: Event | None) -> _ActivePlayback | None:
         """Stop any running player process before spawning the replacement, unless cancelled.
 
         The cancel check shares the lock with stop(), so a cancellation set before stop() can never be missed.
@@ -565,9 +586,9 @@ class SubprocessPlayer:
             if cancel is not None and cancel.is_set():
                 return None
             try:
-                proc = subprocess.Popen(list(self._command), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc = subprocess.Popen(list(command), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except (OSError, ValueError) as err:
-                raise AudioDeviceError("Cannot start audio player.") from err
+                raise AudioDeviceError(f"Cannot start audio player: {command[0]}.") from err
             self._active = _ActivePlayback(proc)
             return self._active
 
@@ -579,11 +600,12 @@ class SubprocessPlayer:
 
     def play(self, clip: AudioClip, cancel: Event | None = None) -> None:
         """Play a WAV clip synchronously; return quietly if cancelled or stopped intentionally."""
-        active = self._start(cancel)
+        command, payload = self._player_input(clip)
+        active = self._start(command, cancel)
         if active is None:
             return
         try:
-            _write_clip(active.process, clip)
+            _write_clip(active.process, payload)
         except AudioDeviceError:
             if not active.stopped:
                 raise
@@ -650,7 +672,7 @@ class Speaker:
     """
 
     def __init__(self, engine: TtsEngine | None = None, player: AudioPlayer | None = None) -> None:
-        """Use eSpeak NG and aplay by default, resolving eSpeak on first speech call."""
+        """Use eSpeak NG and PipeWire by default, resolving eSpeak on first speech call."""
         self._source: str = _engine_source(engine)
         self._engine: TtsEngine | None = engine
         self._player: AudioPlayer = SubprocessPlayer() if player is None else player
