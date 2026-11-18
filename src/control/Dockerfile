@@ -8,7 +8,7 @@ SHELL ["/bin/bash", "-c"]
 RUN apt-get update && \
     apt-get full-upgrade -y && \
     rosdep update --rosdistro $ROS_DISTRO && \
-    apt-get install python3-pip && \
+    apt-get install python3-pip -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
