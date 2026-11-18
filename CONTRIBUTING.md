@@ -8,6 +8,7 @@ Install Python 3.12 or newer, then create and activate a virtual environment and
 python3 -m venv .venv
 source .venv/bin/activate
 pip install ruff
+git submodule update --init
 ```
 
 On Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
