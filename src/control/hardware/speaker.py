@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import signal
-import shutil
 import socket
 import struct
 import subprocess
@@ -26,6 +25,8 @@ from threading import Condition, Event, Lock, Thread
 from time import monotonic
 from typing import Protocol
 from urllib.parse import SplitResult, urlsplit
+
+import espeak_ng
 
 LOGGER: logging.Logger = logging.getLogger(__name__)
 MAX_AUDIO_SIZE_BYTES: int = 50 * 1024 * 1024
@@ -56,8 +57,8 @@ class TtsError(SpeakerError):
     """A speech engine could not be configured or synthesize audio."""
 
 
-class _SynthesisCleanupError(TtsError):
-    """A cancelled or timed-out synthesis process could not be stopped."""
+class _HttpWorkerCleanupError(TtsError):
+    """A cancelled or timed-out HTTP synthesis worker could not be stopped."""
 
 
 class VolumeError(SpeakerError):
@@ -254,6 +255,16 @@ def _clean_text(text: str) -> str:
     return cleaned
 
 
+def _normalize_tts_language(language: str) -> str:
+    """Validate and normalize an eSpeak language or HTTP service language."""
+    if not isinstance(language, str):
+        raise TtsError("Invalid speech language.")
+    normalized = language.strip()
+    if not normalized or normalized.startswith("-"):
+        raise TtsError("Invalid speech language.")
+    return normalized
+
+
 def _tts_clip(data: bytes) -> AudioClip:
     """Validate synthesizer output and normalize streaming WAV headers."""
     try:
@@ -262,24 +273,14 @@ def _tts_clip(data: bytes) -> AudioClip:
         raise TtsError("Speech engine returned invalid audio.") from err
 
 
-def _find_espeak(binary: str) -> tuple[str, str]:
-    """Return the name and path of the preferred installed eSpeak executable."""
-    candidates = ("espeak", "espeak-ng") if binary == "espeak" else ("espeak-ng", "espeak")
-    for name in candidates:
-        executable = shutil.which(name)
-        if executable is not None:
-            return name, executable
-    raise TtsError("Neither espeak-ng nor espeak is installed.")
-
-
 def _check_synthesis_cancel(cancel: Event | None) -> None:
     """Raise when synthesis has been cancelled."""
     if cancel is not None and cancel.is_set():
         raise PlaybackCancelledError(CancelReason.STOPPED)
 
 
-def _communicate_synthesis(process: subprocess.Popen[bytes], data: bytes, cancel: Event | None, deadline: float) -> tuple[bytes, bytes]:
-    """Poll a process while observing cancellation and the total deadline."""
+def _communicate_http_worker(process: subprocess.Popen[bytes], data: bytes, cancel: Event | None, deadline: float) -> tuple[bytes, bytes]:
+    """Poll the HTTP synthesis worker while observing cancellation and the total deadline."""
     pending: bytes | None = data
     while True:
         _check_synthesis_cancel(cancel)
@@ -292,26 +293,33 @@ def _communicate_synthesis(process: subprocess.Popen[bytes], data: bytes, cancel
             pending = None
 
 
-def _cleanup_synthesis(process: subprocess.Popen[bytes]) -> None:
-    """Stop the synthesis process tree and reap it within a bounded cleanup period."""
+def _kill_http_worker(process: subprocess.Popen[bytes]) -> None:
+    """Force-stop an active HTTP synthesis worker without risking a reaped process group."""
+    if os.name == "posix":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    elif process.poll() is None:
+        process.kill()
+
+
+def _cleanup_http_worker(process: subprocess.Popen[bytes]) -> None:
+    """Stop the HTTP synthesis worker tree and reap it within a bounded cleanup period."""
+    if process.returncode is not None:
+        return
     try:
-        if os.name == "posix":
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        elif process.poll() is None:
-            process.kill()
+        _kill_http_worker(process)
         process.communicate(timeout=STOP_TIMEOUT_S)
     except subprocess.TimeoutExpired as err:
-        raise _SynthesisCleanupError("Speech engine cleanup timed out.") from err
+        raise _HttpWorkerCleanupError("HTTP synthesis worker cleanup timed out.") from err
     except (OSError, ValueError, subprocess.SubprocessError) as err:
-        raise _SynthesisCleanupError("Could not stop speech engine process.") from err
+        raise _HttpWorkerCleanupError("Could not stop HTTP synthesis worker.") from err
 
 
-def _synthesis_result(process: subprocess.Popen[bytes], data: bytes, cancel: Event | None, deadline: float) -> bytes:
-    """Collect a successful process result or translate its failure."""
-    output, stderr = _communicate_synthesis(process, data, cancel, deadline)
+def _http_worker_result(process: subprocess.Popen[bytes], data: bytes, cancel: Event | None, deadline: float) -> bytes:
+    """Collect a successful HTTP worker result or translate its failure."""
+    output, stderr = _communicate_http_worker(process, data, cancel, deadline)
     _check_synthesis_cancel(cancel)
     if process.returncode:
         detail = stderr.decode("utf-8", errors="replace").strip()
@@ -319,8 +327,8 @@ def _synthesis_result(process: subprocess.Popen[bytes], data: bytes, cancel: Eve
     return output
 
 
-def _synthesis_process(command: list[str], data: bytes, cancel: Event | None) -> bytes:
-    """Run a bounded synthesis process and reap it on cancellation or timeout."""
+def _run_http_worker(command: list[str], data: bytes, cancel: Event | None) -> bytes:
+    """Run a bounded HTTP synthesis worker and reap it on cancellation or timeout."""
     _check_synthesis_cancel(cancel)
     deadline = monotonic() + SYNTHESIS_TIMEOUT_S
     try:
@@ -332,36 +340,113 @@ def _synthesis_process(command: list[str], data: bytes, cancel: Event | None) ->
             start_new_session=os.name == "posix",
         )
         try:
-            return _synthesis_result(process, data, cancel, deadline)
+            return _http_worker_result(process, data, cancel, deadline)
         finally:
-            _cleanup_synthesis(process)
+            _cleanup_http_worker(process)
     except (OSError, ValueError, subprocess.SubprocessError) as err:
-        raise TtsError("Speech engine process failed.") from err
+        raise TtsError("HTTP synthesis worker failed.") from err
+
+
+_ESPEAK_SYNTHESIS_LOCK: Lock = Lock()
+
+
+class _EspeakCapture:
+    """Collect bounded 16-bit PCM from the eSpeak synthesis callback."""
+
+    def __init__(self, cancel: Event | None) -> None:
+        """Prepare one cancellable synchronous synthesis capture."""
+        self._cancel: Event | None = cancel
+        self._deadline: float = monotonic() + SYNTHESIS_TIMEOUT_S
+        self._frames: bytearray = bytearray()
+        self._error: SpeakerError | None = None
+
+    def __call__(self, wav: bytes, num_samples: int, event: object) -> int:
+        """Collect an audio chunk, returning one to stop eSpeak on cancellation or failure."""
+        del num_samples, event
+        try:
+            _check_synthesis_cancel(self._cancel)
+            if monotonic() >= self._deadline:
+                raise TtsError("Speech engine timed out.")
+            if len(self._frames) + len(wav) > MAX_AUDIO_SIZE_BYTES:
+                raise TtsError("Speech engine output exceeds the size limit.")
+            self._frames.extend(wav)
+            return 0
+        except (PlaybackCancelledError, TtsError) as err:
+            self._error = err
+            return 1
+
+    def raise_if_failed(self) -> None:
+        """Re-raise an error recorded by the callback, if any."""
+        if self._error is not None:
+            raise self._error
+
+    def result(self) -> bytes:
+        """Return complete PCM frames or re-raise an error recorded by the callback."""
+        self.raise_if_failed()
+        if not self._frames or len(self._frames) % 2:
+            raise TtsError("Speech engine returned invalid audio.")
+        return bytes(self._frames)
+
+
+def _discard_espeak_audio(wav: bytes, num_samples: int, event: object) -> int:
+    """Discard callbacks left over after a completed synchronous request."""
+    del wav, num_samples, event
+    return 0
+
+
+def _run_espeak_synthesis(language: str, text: str, capture: _EspeakCapture) -> tuple[int, int, bytes]:
+    """Run one callback-driven eSpeak request while its global state is locked."""
+    sample_rate = espeak_ng.initialize(output=espeak_ng.espeak_AUDIO_OUTPUT.AUDIO_OUTPUT_SYNCHRONOUS)
+    if not espeak_ng.set_voice_by_properties(name=language):
+        raise TtsError("Speech engine could not select the configured language.")
+    espeak_ng.set_synth_callback(capture)
+    try:
+        espeak_ng.synth(text)
+    finally:
+        espeak_ng.set_synth_callback(_discard_espeak_audio)
+    return 1, sample_rate, capture.result()
+
+
+def _synthesize_espeak(language: str, text: str, cancel: Event | None) -> AudioClip:
+    """Synthesize and encode PCM while translating library errors."""
+    _check_synthesis_cancel(cancel)
+    capture = _EspeakCapture(cancel)
+    try:
+        with _ESPEAK_SYNTHESIS_LOCK:
+            return _encode_pcm(*_run_espeak_synthesis(language, text, capture))
+    except (PlaybackCancelledError, TtsError):
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError) as err:
+        capture.raise_if_failed()
+        raise TtsError("Speech engine failed to synthesize audio.") from err
 
 
 class EspeakEngine:
-    """Synthesize speech synchronously via local eSpeak NG or eSpeak."""
+    """Synthesize speech synchronously via the local eSpeak NG library."""
 
-    def __init__(self, voice: str = "de", binary: str = "espeak-ng") -> None:
-        """Resolve an installed eSpeak executable and validate the voice name."""
-        if not isinstance(voice, str) or not voice.strip() or voice.startswith("-"):
-            raise TtsError("Invalid speech voice.")
-        name, executable = _find_espeak(binary)
-        self._source: str = name
-        self._command: list[str] = [executable, "--stdout", "--stdin", "-b", "1", "-v", voice]
+    def __init__(self, voice: str = "de", binary: str = "espeak-ng", language: str | None = None) -> None:
+        """Select a language or voice while retaining the legacy binary argument."""
+        del binary
+        self._source: str = "espeak-ng"
+        self._language: str = _normalize_tts_language(voice if language is None else language)
 
     @property
     def source(self) -> str:
-        """Return the name of the eSpeak executable actually in use."""
+        """Return the eSpeak NG library source name."""
         return self._source
 
+    @property
+    def language(self) -> str:
+        """Return the selected eSpeak language or voice."""
+        return self._language
+
     def synthesize(self, text: str) -> AudioClip:
-        """Run eSpeak synchronously and return a validated WAV clip."""
+        """Synthesize eSpeak audio and return a validated WAV clip."""
         return self.synthesize_cancellable(text, None)
 
     def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
-        """Run eSpeak with cancellation support."""
-        return _tts_clip(_synthesis_process(self._command, text.encode("utf-8"), cancel))
+        """Synthesize eSpeak audio with callback-based cancellation and bounds."""
+        return _synthesize_espeak(self._language, text, cancel)
 
 
 def _endpoint(source: str) -> SplitResult:
@@ -413,17 +498,16 @@ class _HttpCall:
     """Run an HTTP request in a process so DNS and connection attempts can be stopped."""
 
     def __init__(self, url: SplitResult, target: str, body: bytes, headers: dict[str, str]) -> None:
-        """Prepare the request and fix its total deadline."""
+        """Prepare the request."""
         self._url: SplitResult = url
         self._request: tuple[str, bytes, dict[str, str]] = (target, body, headers)
-        self._deadline: float = monotonic() + SYNTHESIS_TIMEOUT_S
 
     def run(self, cancel: Event | None = None) -> AudioClip:
         """Return the clip or stop and reap the worker on cancellation or timeout."""
         target, body, headers = self._request
         request = json.dumps({"url": self._url.geturl(), "target": target, "body": body.decode(), "headers": headers}).encode()
         command = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--tts-http-worker"]
-        result = _synthesis_process(command, request, cancel)
+        result = _run_http_worker(command, request, cancel)
         if not result:
             raise TtsError("Speech service returned no result.")
         if result[:1] != b"\x00":
@@ -431,7 +515,8 @@ class _HttpCall:
         return AudioClip(result[1:])
 
     def _send(self) -> AudioClip:
-        """Connect, POST the request and read the validated WAV response."""
+        """Connect, POST the request and read the validated WAV response within the total deadline."""
+        deadline = monotonic() + SYNTHESIS_TIMEOUT_S
         connection = HTTPSConnection if self._url.scheme == "https" else HTTPConnection
         target, body, headers = self._request
         with closing(connection(self._url.netloc, timeout=SYNTHESIS_TIMEOUT_S)) as client:
@@ -441,7 +526,7 @@ class _HttpCall:
                 raise OSError("Speech service did not provide a socket.")
             client.request("POST", target, body=body, headers=headers)
             with client.getresponse() as response:
-                return _response_audio(sock, response, self._deadline)
+                return _response_audio(sock, response, deadline)
 
 
 def _http_worker() -> None:
@@ -458,18 +543,24 @@ def _http_worker() -> None:
 class HttpEngine:
     """Synthesize speech synchronously by posting JSON to an HTTP endpoint."""
 
-    def __init__(self, url: str, api_key_env: str | None = "TTS_API_KEY") -> None:
+    def __init__(self, url: str, api_key_env: str | None = "TTS_API_KEY", language: str = "de") -> None:
         """Bind synthesis requests to one validated HTTP or HTTPS endpoint."""
         if not isinstance(url, str):
             raise TtsError("Invalid HTTP speech endpoint.")
         self._url: SplitResult = _endpoint(url)
         self._source: str = url
         self._api_key_env: str | None = api_key_env
+        self._language: str = _normalize_tts_language(language)
 
     @property
     def source(self) -> str:
         """Return the endpoint URL."""
         return self._source
+
+    @property
+    def language(self) -> str:
+        """Return the language sent with synthesis requests."""
+        return self._language
 
     def _headers(self) -> dict[str, str]:
         """Include the optional bearer token only over HTTPS or loopback HTTP."""
@@ -492,19 +583,19 @@ class HttpEngine:
 
     def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
         """POST the utterance with cancellation support."""
-        body = json.dumps({"text": text}).encode()
+        body = json.dumps({"text": text, "language": self._language}).encode()
         return _HttpCall(self._url, self._target(), body, self._headers()).run(cancel)
 
 
-def create_tts_engine(source: str) -> EspeakEngine | HttpEngine:
-    """Create an eSpeak or HTTP speech engine from a source identifier."""
+def create_tts_engine(source: str, language: str = "de") -> EspeakEngine | HttpEngine:
+    """Create an eSpeak or HTTP speech engine from a source identifier and language."""
     if not isinstance(source, str):
         raise TtsError("Speech engine source must be a string.")
     normalized = source.strip().lower()
     if normalized in {"espeak", "espeak-ng"}:
-        return EspeakEngine(binary=normalized)
+        return EspeakEngine(binary=normalized, language=language)
     if "://" in normalized:
-        return HttpEngine(source.strip())
+        return HttpEngine(source.strip(), language=language)
     raise TtsError("Unsupported speech engine source.")
 
 
@@ -656,11 +747,22 @@ def _produce_clip(request: _Request, produce: Callable[[_Request], AudioClip]) -
     """Prefer a cancellation over an ordinary preparation error, but report failed cleanup."""
     try:
         return produce(request)
-    except _SynthesisCleanupError:
+    except _HttpWorkerCleanupError:
         raise
     except Exception:
         request.raise_if_cancelled()
         raise
+
+
+def _speaker_language(engine: TtsEngine | None, language: str | None) -> str:
+    """Select a language that is compatible with an optional custom engine."""
+    engine_language = getattr(engine, "language", None)
+    if engine_language is not None:
+        engine_language = _normalize_tts_language(engine_language)
+    selected_language = _normalize_tts_language(language if language is not None else engine_language or "de")
+    if engine_language is not None and selected_language != engine_language:
+        raise TtsError("Speaker language does not match the speech engine language.")
+    return selected_language
 
 
 class Speaker:
@@ -671,9 +773,13 @@ class Speaker:
     volume limit interrupt it, in which case the affected call raises PlaybackCancelledError.
     """
 
-    def __init__(self, engine: TtsEngine | None = None, player: AudioPlayer | None = None) -> None:
-        """Use eSpeak NG and PipeWire by default, resolving eSpeak on first speech call."""
-        self._source: str = _engine_source(engine)
+    def __init__(self, engine: TtsEngine | None = None, player: AudioPlayer | None = None, language: str | None = None) -> None:
+        """Use eSpeak NG and PipeWire by default, resolving eSpeak on first speech call.
+
+        Raises:
+            TtsError: ``language`` differs from the language of the given ``engine``.
+        """
+        self._source, self._language = _engine_source(engine), _speaker_language(engine, language)
         self._engine: TtsEngine | None = engine
         self._player: AudioPlayer = SubprocessPlayer() if player is None else player
         self._lock: Lock = Lock()
@@ -688,11 +794,11 @@ class Speaker:
     def _resolve_engine(self) -> TtsEngine:
         """Instantiate the configured TTS engine lazily on first speech request."""
         with self._lock:
-            engine, source = self._engine, self._source
+            engine, source, language = self._engine, self._source, self._language
         if engine is None:
-            engine = create_tts_engine(source)
+            engine = create_tts_engine(source, language)
             with self._lock:
-                if self._engine is None and self._source == source:
+                if self._engine is None and self._source == source and self._language == language:
                     self._engine, self._source = engine, engine.source
         return engine
 
@@ -819,16 +925,23 @@ class Speaker:
             self._active.cancel_with(CancelReason.SKIPPED)
             self._player.stop()
 
-    def set_tts_source(self, source: str) -> None:
-        """Validate and switch the speech engine to eSpeak or an HTTP endpoint."""
-        engine = create_tts_engine(source)
+    def set_tts_source(self, source: str, language: str | None = None) -> None:
+        """Validate and switch the speech engine, optionally changing its language."""
         with self._lock:
-            self._source, self._engine = engine.source, engine
+            selected_language = self._language if language is None else language
+        engine = create_tts_engine(source, selected_language)
+        with self._lock:
+            self._source, self._language, self._engine = engine.source, engine.language, engine
 
     def get_tts_source(self) -> str:
         """Return the configured speech engine source."""
         with self._lock:
             return self._source
+
+    def get_tts_language(self) -> str:
+        """Return the configured speech language."""
+        with self._lock:
+            return self._language
 
     def set_volume(self, volume_percent: int) -> None:
         """Set the playback volume percentage for subsequent clips."""

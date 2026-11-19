@@ -2,7 +2,7 @@
 name = "hw-it-pib-roboter"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["espeak-ng-python"]
 
 [dependency-groups]
 dev = ["ruff"]
