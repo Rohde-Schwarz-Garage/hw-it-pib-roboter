@@ -2,37 +2,28 @@
 
 from __future__ import annotations
 
-import json
-import logging
 import math
-import os
-import socket
 import subprocess
+import sys
 import unicodedata
 import wave
 from collections.abc import Callable
-from contextlib import closing, suppress
+from contextlib import suppress
 from dataclasses import dataclass, field
-from http.client import HTTPConnection, HTTPException, HTTPResponse, HTTPSConnection
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Condition, Event, Lock
 from time import monotonic
 from typing import Protocol
-from urllib.parse import SplitResult, urlsplit
 
 import espeakng
 import sounddevice
 
-LOGGER: logging.Logger = logging.getLogger(__name__)
 MAX_AUDIO_SIZE_BYTES: int = 50 * 1024 * 1024
 MAX_TEXT_LENGTH: int = 500
-HTTP_CHUNK_BYTES: int = 65536
 SYNTHESIS_TIMEOUT_S: float = 15.0
 OUTPUT_CHUNK_FRAMES: int = 1024
-WAV_MEDIA_TYPES: frozenset[str] = frozenset({"audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave"})
-LOOPBACK_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
 INVISIBLE_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cf", "Cs"})
 _AUDIO_BACKEND_ERRORS: tuple[type[Exception], ...] = (OSError, RuntimeError, TypeError, ValueError, sounddevice.PortAudioError)
 
@@ -189,7 +180,7 @@ def _clean_text(text: str) -> str:
 
 
 def _normalize_tts_language(language: str) -> str:
-    """Validate and normalize an eSpeak language or HTTP service language."""
+    """Validate and normalize an eSpeak language."""
     if not isinstance(language, str):
         raise TtsError("Invalid speech language.")
     normalized = language.strip()
@@ -340,136 +331,93 @@ class EspeakEngine:
         return _synthesize_espeak(self._language, text, cancel)
 
 
-def _endpoint(source: str) -> SplitResult:
-    """Validate an absolute HTTP or HTTPS URL without credentials or fragments."""
+def _piper_model_matches(path: Path, language: str, model: str | None) -> bool:
+    """Match a standard Piper voice name against the requested language and model."""
+    locale = path.stem.split("-", 1)[0].lower()
+    requested = language.replace("-", "_").lower()
+    language_matches = locale == requested or ("_" not in requested and locale.startswith(requested + "_"))
+    return language_matches and (model is None or model in {path.stem, path.name})
+
+
+def _select_piper_model(directory: str | Path | None, language: str, model: str | None) -> Path:
+    """Select exactly one complete Piper voice from a directory."""
+    if directory is None:
+        raise TtsError("Piper requires a model directory.")
     try:
-        url = urlsplit(source)
-        if url.scheme not in {"http", "https"} or not url.hostname or url.port == 0:
-            raise ValueError
-        if url.username is not None or url.password is not None or url.fragment:
-            raise ValueError
-        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in source):
-            raise ValueError
-        return url
-    except ValueError as err:
-        raise TtsError("Invalid HTTP speech endpoint.") from err
+        folder = Path(directory).resolve(strict=True)
+        if not folder.is_dir():
+            raise TtsError("Piper model path must be a directory.")
+        return _find_piper_model(folder, language, model)
+    except (OSError, RuntimeError, TypeError, ValueError) as err:
+        raise TtsError("Cannot read Piper model directory.") from err
 
 
-def _read_http_body(sock: socket.socket, response: HTTPResponse, deadline: float) -> bytes:
-    """Read a bounded HTTP response body, re-arming the socket timeout to the remaining deadline per chunk."""
-    chunks = bytearray()
-    while len(chunks) <= MAX_AUDIO_SIZE_BYTES:
-        if response.isclosed():
-            return bytes(chunks)
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TimeoutError("Speech response timed out.")
-        sock.settimeout(remaining)
-        block = response.read1(min(HTTP_CHUNK_BYTES, MAX_AUDIO_SIZE_BYTES + 1 - len(chunks)))
-        if not block:
-            return bytes(chunks)
-        chunks.extend(block)
-    raise TtsError("Speech response exceeds the size limit.")
+def _find_piper_model(folder: Path, language: str, model: str | None) -> Path:
+    """Find one matching model and verify its companion configuration exists."""
+    if model is not None and (not isinstance(model, str) or not model):
+        raise TtsError("Invalid Piper model name.")
+    matches = [path for path in folder.glob("*.onnx") if path.is_file() and _piper_model_matches(path, language, model)]
+    if len(matches) != 1:
+        raise TtsError("Piper requires exactly one matching model; specify a model name if needed.")
+    if not Path(str(matches[0]) + ".json").is_file():
+        raise TtsError("Piper model configuration file is missing.")
+    return matches[0]
 
 
-def _response_audio(sock: socket.socket, response: HTTPResponse, deadline: float) -> AudioClip:
-    """Validate HTTP status, media type and payload bounds without following redirects."""
-    if not 200 <= response.status < 300 or response.headers.get_content_type() not in WAV_MEDIA_TYPES:
-        raise TtsError("Speech service did not return a WAV response.")
-    expected = response.length
-    if expected is not None and expected > MAX_AUDIO_SIZE_BYTES:
-        raise TtsError("Speech response exceeds the size limit.")
-    data = _read_http_body(sock, response, deadline)
-    if expected is not None and len(data) != expected:
-        raise TtsError("Incomplete speech response.")
-    return AudioClip(data)
+def _run_piper(model: Path, text: str, output_directory: str, cancel: Event | None) -> AudioClip:
+    """Run Piper in a cancellable process and return validated WAV audio."""
+    output_path = Path(output_directory) / "speech.wav"
+    input_path = Path(output_directory) / "input.txt"
+    input_path.write_text(text, encoding="utf-8")
+    command = [sys.executable, "-m", "piper", "--model", str(model), "--output-file", str(output_path), "--input-file", str(input_path)]
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _wait_for_espeak(process, cancel)
+    finally:
+        _terminate_espeak(process)
+    rate, frames = _read_espeak_output(output_path)
+    return _encode_pcm(1, rate, frames)
 
 
-class _HttpCall:
-    """Send one HTTP synthesis request."""
+class PiperEngine:
+    """Synthesize speech using a local Piper voice."""
 
-    def __init__(self, url: SplitResult, target: str, body: bytes, headers: dict[str, str]) -> None:
-        """Prepare the request."""
-        self._url: SplitResult = url
-        self._request: tuple[str, bytes, dict[str, str]] = (target, body, headers)
-
-    def run(self, cancel: Event | None = None) -> AudioClip:
-        """Return the clip; cancellation is checked before and after the blocking request."""
-        _raise_if_cancelled(cancel)
-        try:
-            clip = self._send()
-        except (HTTPException, OSError, ValueError) as err:
-            raise TtsError(str(err)) from err
-        _raise_if_cancelled(cancel)
-        return clip
-
-    def _send(self) -> AudioClip:
-        """Connect, POST the request and read the validated WAV response; DNS lookup is not bounded by the timeout."""
-        deadline = monotonic() + SYNTHESIS_TIMEOUT_S
-        connection = HTTPSConnection if self._url.scheme == "https" else HTTPConnection
-        target, body, headers = self._request
-        with closing(connection(self._url.netloc, timeout=SYNTHESIS_TIMEOUT_S)) as client:
-            client.connect()
-            sock = client.sock
-            if sock is None:
-                raise OSError("Speech service did not provide a socket.")
-            client.request("POST", target, body=body, headers=headers)
-            with client.getresponse() as response:
-                return _response_audio(sock, response, deadline)
-
-
-class HttpEngine:
-    """Synthesize speech synchronously by posting JSON to an HTTP endpoint."""
-
-    def __init__(self, url: str, api_key_env: str | None = "TTS_API_KEY", language: str = "de") -> None:
-        """Bind synthesis requests to one validated HTTP or HTTPS endpoint."""
-        if not isinstance(url, str):
-            raise TtsError("Invalid HTTP speech endpoint.")
-        self._url: SplitResult = _endpoint(url)
-        self._source: str = url
-        self._api_key_env: str | None = api_key_env
+    def __init__(self, language: str, model_dir: str | Path | None, model: str | None = None) -> None:
+        """Select a Piper voice for the requested language."""
         self._language: str = _normalize_tts_language(language)
+        self._model: Path = _select_piper_model(model_dir, self._language, model)
 
     @property
     def source(self) -> str:
-        """Return the endpoint URL."""
-        return self._source
+        """Return the Piper source name."""
+        return "piper"
 
     @property
     def language(self) -> str:
-        """Return the language sent with synthesis requests."""
+        """Return the selected language."""
         return self._language
 
-    def _headers(self) -> dict[str, str]:
-        """Include the optional bearer token only over HTTPS or loopback HTTP."""
-        headers = {"Content-Type": "application/json", "Accept": "audio/wav"}
-        key = os.environ.get(self._api_key_env) if self._api_key_env else None
-        if key and (self._url.scheme == "https" or self._url.hostname in LOOPBACK_HOSTS):
-            headers["Authorization"] = f"Bearer {key}"
-        elif key:
-            LOGGER.warning("API key withheld because the speech endpoint is not encrypted.")
-        return headers
-
-    def _target(self) -> str:
-        """Build the HTTP origin-form request target without corrupting leading slashes."""
-        path = self._url.path or "/"
-        return f"{path}?{self._url.query}" if self._url.query else path
-
     def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
-        """POST the utterance and return a WAV clip within the total deadline, with cancellation support."""
-        body = json.dumps({"text": text, "language": self._language}).encode()
-        return _HttpCall(self._url, self._target(), body, self._headers()).run(cancel)
+        """Synthesize a WAV file while honoring cancellation and the deadline."""
+        _raise_if_cancelled(cancel)
+        try:
+            with TemporaryDirectory() as output_directory:
+                return _run_piper(self._model, text, output_directory, cancel)
+        except (PlaybackCancelledError, TtsError):
+            raise
+        except (OSError, RuntimeError, TypeError, ValueError, wave.Error) as err:
+            raise TtsError("Speech engine failed to synthesize audio.") from err
 
 
-def create_tts_engine(source: str, language: str = "de") -> EspeakEngine | HttpEngine:
-    """Create an eSpeak or HTTP speech engine from a source identifier and language."""
+def create_tts_engine(source: str, language: str = "de", model_dir: str | Path | None = None, model: str | None = None) -> TtsEngine:
+    """Create a speech engine from a source identifier and language."""
     if not isinstance(source, str):
         raise TtsError("Speech engine source must be a string.")
     normalized = source.strip().lower()
     if normalized == "espeak-ng":
         return EspeakEngine(language=language)
-    if "://" in normalized:
-        return HttpEngine(source.strip(), language=language)
+    if normalized == "piper":
+        return PiperEngine(language, model_dir, model)
     raise TtsError("Unsupported speech engine source.")
 
 
@@ -787,11 +735,11 @@ class Speaker:
             self._active.cancel.set()
             self._player.stop()
 
-    def set_tts_source(self, source: str, language: str | None = None) -> None:
-        """Validate and switch the speech engine, optionally changing its language."""
+    def set_tts_source(self, source: str, language: str | None = None, *, model_dir: str | Path | None = None, model: str | None = None) -> None:
+        """Switch engines, optionally selecting a language and Piper model directory and name."""
         with self._lock:
             selected_language = self._language if language is None else language
-        engine = create_tts_engine(source, selected_language)
+        engine = create_tts_engine(source, selected_language, model_dir, model)
         with self._lock:
             self._source, self._language, self._engine = engine.source, engine.language, engine
 
