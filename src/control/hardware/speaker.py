@@ -7,25 +7,22 @@ import logging
 import math
 import os
 import socket
-import struct
-import sys
+import subprocess
 import unicodedata
 import wave
-from array import array
 from collections.abc import Callable
-from concurrent.futures import Future
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import dataclass, field
-from enum import Enum
 from http.client import HTTPConnection, HTTPException, HTTPResponse, HTTPSConnection
 from io import BytesIO
 from pathlib import Path
-from threading import Condition, Event, Lock, Thread
+from tempfile import TemporaryDirectory
+from threading import Condition, Event, Lock
 from time import monotonic
 from typing import Protocol
 from urllib.parse import SplitResult, urlsplit
 
-import espeak_ng
+import espeakng
 import sounddevice
 
 LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -33,13 +30,10 @@ MAX_AUDIO_SIZE_BYTES: int = 50 * 1024 * 1024
 MAX_TEXT_LENGTH: int = 500
 HTTP_CHUNK_BYTES: int = 65536
 SYNTHESIS_TIMEOUT_S: float = 15.0
-SYNTHESIS_POLL_S: float = 0.05
 OUTPUT_CHUNK_FRAMES: int = 1024
-STREAMING_WAV_SIZES: frozenset[int] = frozenset({0x7FFFF000, 0x7FFFFFFF, 0xFFFFFFFF})
 WAV_MEDIA_TYPES: frozenset[str] = frozenset({"audio/wav", "audio/wave", "audio/x-wav", "audio/vnd.wave"})
 LOOPBACK_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
 INVISIBLE_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cf", "Cs"})
-ESPEAK_INITIALIZE_DONT_EXIT: int = 0x8000
 _AUDIO_BACKEND_ERRORS: tuple[type[Exception], ...] = (OSError, RuntimeError, TypeError, ValueError, sounddevice.PortAudioError)
 
 
@@ -59,59 +53,32 @@ class TtsError(SpeakerError):
     """A speech engine could not be configured or synthesize audio."""
 
 
-class VolumeError(SpeakerError):
-    """A volume setting violates the hearing protection limits."""
-
-
-class InputValidationError(SpeakerError):
-    """Speech input is invalid."""
-
-
-class CancelReason(Enum):
-    """Why a say() or play() request ended without being played completely."""
-
-    STOPPED = "stopped"
-    SKIPPED = "skipped"
-    VOLUME_LIMIT = "volume_limit"
-
-
 class PlaybackCancelledError(SpeakerError):
-    """A request was cancelled on purpose by stop(), skip() or a lowered volume limit before it completed."""
-
-    def __init__(self, reason: CancelReason) -> None:
-        """Store the cancellation reason."""
-        super().__init__(f"Playback cancelled: {reason.value}.")
-        self.reason: CancelReason = reason
+    """A request was cancelled on purpose by stop() or skip() before it completed."""
 
 
 @dataclass(frozen=True)
 class AudioClip:
-    """A complete WAV stream containing signed 16-bit PCM."""
+    """A complete WAV stream containing PCM audio."""
 
     wav_bytes: bytes
 
 
 class TtsEngine(Protocol):
-    """Convert plain text to playable audio."""
+    """Convert plain text to playable audio with cooperative cancellation."""
 
-    def synthesize(self, text: str) -> AudioClip:
-        """Synthesize one utterance."""
+    @property
+    def source(self) -> str:
+        """Return the source identifier accepted by create_tts_engine()."""
         ...
 
-
-class AudioPlayer(Protocol):
-    """Play one clip synchronously and allow interruption."""
-
-    def play(self, clip: AudioClip, cancel: Event | None = None) -> None:
-        """Play audio until completion or interruption.
-
-        Implementations must check ``cancel`` atomically with respect to ``stop`` right before output
-        starts and return without playing if it is set.
-        """
+    @property
+    def language(self) -> str:
+        """Return the synthesis language."""
         ...
 
-    def stop(self) -> None:
-        """Stop the current output, if any."""
+    def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
+        """Synthesize one utterance, raising PlaybackCancelledError once ``cancel`` is set."""
         ...
 
 
@@ -160,62 +127,23 @@ class _Request:
     priority: int
     seq: int
     cancel: Event = field(default_factory=Event)
-    reason: CancelReason | None = None
 
     def order(self) -> tuple[int, int]:
         """Return the sort key: higher priority first, then first come first served."""
         return -self.priority, self.seq
 
-    def cancel_with(self, reason: CancelReason) -> None:
-        """Mark the request as cancelled; the first reason wins. The speaker lock must be held."""
-        if not self.cancel.is_set():
-            self.reason = reason
-            self.cancel.set()
 
-    def raise_if_cancelled(self) -> None:
-        """Raise PlaybackCancelledError if the request has been cancelled."""
-        if self.cancel.is_set():
-            raise PlaybackCancelledError(self.reason or CancelReason.STOPPED)
-
-
-def _pcm_data_size(data: bytes) -> int:
-    """Validate format chunks and retain the declared PCM data byte length."""
-    offset = 12
-    while offset + 8 <= len(data):
-        length = int.from_bytes(data[offset + 4 : offset + 8], "little")
-        if data[offset : offset + 4] == b"data":
-            return length
-        if data[offset : offset + 4] == b"fmt ":
-            encoding = data[offset + 8 : offset + 10]
-            if encoding not in {b"\x01\x00", b"\xfe\xff"} or length < 16 or data[offset + 22 : offset + 24] != b"\x10\x00":
-                raise AudioFileError("Expected 16-bit PCM.")
-        offset += 8 + length + length % 2
-    raise AudioFileError("Missing WAV data chunk.")
-
-
-def _validate_frames(frames: bytes, channels: int, rate: int, expected: int, *, streaming: bool) -> None:
-    """Reject empty, misaligned, out-of-range or truncated PCM payloads."""
-    if not frames or len(frames) % (channels * 2) or not rate:
-        raise AudioFileError("Invalid WAV frames or sample rate.")
-    if channels * 2 > 0xFFFF or rate * channels * 2 > 0xFFFFFFFF:
-        raise AudioFileError("Invalid WAV frame size or byte rate.")
-    if len(frames) != expected and not (streaming and expected in STREAMING_WAV_SIZES):
-        raise AudioFileError("Incomplete WAV payload.")
-
-
-def _read_pcm(data: bytes, *, streaming: bool = False) -> tuple[int, int, bytes]:
-    """Decode bounded 16-bit PCM frames from a WAV byte stream."""
+def _read_pcm(data: bytes) -> tuple[int, int, int, bytes]:
+    """Read bounded PCM frames and their source format from a WAV byte stream."""
     if len(data) > MAX_AUDIO_SIZE_BYTES:
         raise AudioFileError("WAV exceeds the size limit.")
-    expected = _pcm_data_size(data)
     try:
         with wave.open(BytesIO(data), "rb") as reader:
-            channels, rate = reader.getnchannels(), reader.getframerate()
+            channels, rate, sample_width = reader.getnchannels(), reader.getframerate(), reader.getsampwidth()
             frames = reader.readframes(reader.getnframes() + 1)
-    except (wave.Error, EOFError, OSError, ValueError, RuntimeError, struct.error) as err:
+    except (wave.Error, EOFError, OSError, ValueError, RuntimeError) as err:
         raise AudioFileError("Invalid PCM WAV stream.") from err
-    _validate_frames(frames, channels, rate, expected, streaming=streaming)
-    return channels, rate, frames
+    return channels, rate, sample_width, frames
 
 
 def _encode_pcm(channels: int, rate: int, frames: bytes) -> AudioClip:
@@ -225,28 +153,6 @@ def _encode_pcm(channels: int, rate: int, frames: bytes) -> AudioClip:
             writer.setparams((channels, 2, rate, 0, "NONE", "not compressed"))
             writer.writeframes(frames)
         return AudioClip(output.getvalue())
-
-
-def _attenuate_samples(frames: bytes, percent: int) -> bytes:
-    """Scale little-endian 16-bit signed PCM samples by a percentage."""
-    samples = array("h", frames)
-    if sys.byteorder != "little":
-        samples.byteswap()
-    for index, value in enumerate(samples):
-        samples[index] = int(value * percent / 100)
-    if sys.byteorder != "little":
-        samples.byteswap()
-    return samples.tobytes()
-
-
-def _scale(clip: AudioClip, percent: int) -> AudioClip:
-    """Return a canonical WAV clip scaled to the given volume percentage."""
-    channels, rate, frames = _read_pcm(clip.wav_bytes)
-    if percent == 0:
-        frames = bytes(len(frames))
-    elif percent != 100:
-        frames = _attenuate_samples(frames, percent)
-    return _encode_pcm(channels, rate, frames)
 
 
 def _load_file(path: str | Path) -> AudioClip:
@@ -260,7 +166,6 @@ def _load_file(path: str | Path) -> AudioClip:
             data = stream.read(MAX_AUDIO_SIZE_BYTES + 1)
     except (OSError, RuntimeError, TypeError, ValueError) as err:
         raise AudioFileError("Cannot read WAV file.") from err
-    _read_pcm(data)
     return AudioClip(data)
 
 
@@ -274,12 +179,12 @@ def _clean_char(char: str) -> str:
 def _clean_text(text: str) -> str:
     """Normalize speech input and reject non-strings, empty text or oversized text."""
     if not isinstance(text, str):
-        raise InputValidationError("Speech input must be a string.")
+        raise ValueError("Speech input must be a string.")
     if len(text) > MAX_TEXT_LENGTH:
-        raise InputValidationError("Speech input exceeds maximum length.")
+        raise ValueError("Speech input exceeds maximum length.")
     cleaned = " ".join("".join(map(_clean_char, text)).split())
     if not cleaned:
-        raise InputValidationError("Speech input is empty.")
+        raise ValueError("Speech input is empty.")
     return cleaned
 
 
@@ -293,18 +198,10 @@ def _normalize_tts_language(language: str) -> str:
     return normalized
 
 
-def _tts_clip(data: bytes) -> AudioClip:
-    """Validate synthesizer output and normalize streaming WAV headers."""
-    try:
-        return _encode_pcm(*_read_pcm(data, streaming=True))
-    except AudioFileError as err:
-        raise TtsError("Speech engine returned invalid audio.") from err
-
-
-def _check_synthesis_cancel(cancel: Event | None) -> None:
-    """Raise when synthesis has been cancelled."""
+def _raise_if_cancelled(cancel: Event | None) -> None:
+    """Raise PlaybackCancelledError if the request has been cancelled."""
     if cancel is not None and cancel.is_set():
-        raise PlaybackCancelledError(CancelReason.STOPPED)
+        raise PlaybackCancelledError("Playback cancelled.")
 
 
 _ESPEAK_SYNTHESIS_LOCK: Lock = Lock()
@@ -312,130 +209,131 @@ _ESPEAK_SYNTHESIS_LOCK: Lock = Lock()
 
 @dataclass
 class _EspeakRuntime:
-    """Process-wide eSpeak state; only touched while _ESPEAK_SYNTHESIS_LOCK is held."""
+    """Process-wide eSpeak voice list; only touched while _ESPEAK_SYNTHESIS_LOCK is held."""
 
-    sample_rate: int = 0
-    voices: tuple[tuple[str, str], ...] = ()
+    voices: tuple[str, ...] = ()
 
 
 _ESPEAK_RUNTIME: _EspeakRuntime = _EspeakRuntime()
 
 
 def _initialize_espeak() -> _EspeakRuntime:
-    """Initialize eSpeak once per process without letting missing data terminate the interpreter."""
-    if _ESPEAK_RUNTIME.sample_rate <= 0:
-        output = espeak_ng.espeak_AUDIO_OUTPUT.AUDIO_OUTPUT_SYNCHRONOUS
-        sample_rate = espeak_ng.initialize(output=output, options=ESPEAK_INITIALIZE_DONT_EXIT)
-        if sample_rate <= 0:
-            raise TtsError("Speech engine data could not be loaded.")
-        voices = tuple((voice["name"].lower(), voice["identifier"].lower()) for voice in espeak_ng.list_voices())
-        _ESPEAK_RUNTIME.sample_rate, _ESPEAK_RUNTIME.voices = sample_rate, voices
+    """Cache the voice list exposed by the espeakng wrapper."""
+    if not _ESPEAK_RUNTIME.voices:
+        _ESPEAK_RUNTIME.voices = tuple(voice.lower() for voice in espeakng.Speaker.list_voices())
     return _ESPEAK_RUNTIME
 
 
-def _espeak_voice_known(voices: tuple[tuple[str, str], ...], language: str) -> bool:
-    """Mirror eSpeak's ASCII name lookup so selection never reaches the binding's uninitialized voice identifier."""
+def _espeak_voice_known(voices: tuple[str, ...], language: str) -> bool:
+    """Check a language against the voice codes exposed by espeakng."""
     base = language.split("+", 1)[0].lower()
     if not base or not base.isascii():
         return False
-    return any(base in (name, identifier) or identifier.endswith(f"/{base}") for name, identifier in voices)
+    return base in voices
 
 
-class _EspeakCapture:
-    """Collect bounded 16-bit PCM from the eSpeak synthesis callback."""
-
-    def __init__(self, cancel: Event | None) -> None:
-        """Prepare one cancellable synchronous synthesis capture."""
-        self._cancel: Event | None = cancel
-        self._deadline: float = monotonic() + SYNTHESIS_TIMEOUT_S
-        self._frames: bytearray = bytearray()
-        self._error: SpeakerError | None = None
-
-    def __call__(self, wav: bytes | None, num_samples: int, event: object) -> int:
-        """Collect an audio chunk, returning one to stop eSpeak on cancellation or failure."""
-        del num_samples, event
-        if wav is None:
-            return 0  # eSpeak marks the end of synthesis with a NULL buffer
+def _wait_for_espeak(process: subprocess.Popen[bytes], cancel: Event | None) -> None:
+    """Wait for the eSpeak command while honoring cancellation and the synthesis deadline."""
+    deadline = monotonic() + SYNTHESIS_TIMEOUT_S
+    while True:
+        _raise_if_cancelled(cancel)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise TtsError("Speech engine timed out.")
         try:
-            _check_synthesis_cancel(self._cancel)
-            if monotonic() >= self._deadline:
-                raise TtsError("Speech engine timed out.")
-            if len(self._frames) + len(wav) > MAX_AUDIO_SIZE_BYTES:
-                raise TtsError("Speech engine output exceeds the size limit.")
-            self._frames.extend(wav)
-            return 0
-        except (PlaybackCancelledError, TtsError) as err:
-            self._error = err
-            return 1
-
-    def raise_if_failed(self) -> None:
-        """Re-raise an error recorded by the callback, if any."""
-        if self._error is not None:
-            raise self._error
-
-    def result(self) -> bytes:
-        """Return complete PCM frames or re-raise an error recorded by the callback."""
-        self.raise_if_failed()
-        if not self._frames or len(self._frames) % 2:
-            raise TtsError("Speech engine returned invalid audio.")
-        return bytes(self._frames)
+            if process.wait(timeout=min(remaining, 0.05)) != 0:
+                raise TtsError("Speech engine failed to synthesize audio.")
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
-def _discard_espeak_audio(wav: bytes, num_samples: int, event: object) -> int:
-    """Discard callbacks left over after a completed synchronous request."""
-    del wav, num_samples, event
-    return 0
+def _terminate_espeak(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a still-running eSpeak command and reap it."""
+    if process.poll() is None:
+        with suppress(OSError):
+            process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            with suppress(OSError):
+                process.kill()
+            process.wait()
 
 
-def _run_espeak_synthesis(language: str, text: str, capture: _EspeakCapture) -> tuple[int, int, bytes]:
-    """Run one callback-driven eSpeak request while its global state is locked."""
-    runtime = _initialize_espeak()
-    if not _espeak_voice_known(runtime.voices, language) or not espeak_ng.set_voice_by_properties(name=language):
-        raise TtsError("Speech engine could not select the configured language.")
-    espeak_ng.set_synth_callback(capture)
+def _read_espeak_frames(reader: wave.Wave_read) -> tuple[int, bytes]:
+    """Read bounded mono 16-bit PCM from an opened eSpeak WAV file."""
+    channels, rate, sample_width = reader.getnchannels(), reader.getframerate(), reader.getsampwidth()
+    if channels != 1 or sample_width != 2 or reader.getnframes() * channels * sample_width > MAX_AUDIO_SIZE_BYTES:
+        raise TtsError("Speech engine output exceeds the size limit or has an invalid format.")
+    frames = reader.readframes(reader.getnframes() + 1)
+    if not frames or len(frames) % 2:
+        raise TtsError("Speech engine returned invalid audio.")
+    return rate, frames
+
+
+def _read_espeak_output(path: Path) -> tuple[int, bytes]:
+    """Read bounded mono 16-bit PCM written by the eSpeak command."""
     try:
-        espeak_ng.synth(text)
+        with wave.open(str(path), "rb") as reader:
+            return _read_espeak_frames(reader)
+    except TtsError:
+        raise
+    except (wave.Error, EOFError, OSError, ValueError, RuntimeError) as err:
+        raise TtsError("Speech engine returned invalid audio.") from err
+
+
+def _run_espeak_command(language: str, text: str, output_path: Path, cancel: Event | None) -> None:
+    """Run the wrapper-generated WAV export command with cancellation and timeout checks."""
+    command = espeakng.Speaker(voice=language).generate_command(text, export_path=str(output_path))
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _wait_for_espeak(process, cancel)
     finally:
-        espeak_ng.set_synth_callback(_discard_espeak_audio)
-    return 1, runtime.sample_rate, capture.result()
+        _terminate_espeak(process)
+
+
+def _run_espeak_synthesis(language: str, text: str, cancel: Event | None) -> tuple[int, int, bytes]:
+    """Run one WAV-exporting eSpeak command while its global state is locked."""
+    runtime = _initialize_espeak()
+    if not _espeak_voice_known(runtime.voices, language):
+        raise TtsError("Speech engine could not select the configured language.")
+    _raise_if_cancelled(cancel)
+    with TemporaryDirectory() as output_directory:
+        output_path = Path(output_directory) / "speech.wav"
+        _run_espeak_command(language, text, output_path, cancel)
+        rate, frames = _read_espeak_output(output_path)
+    return 1, rate, frames
 
 
 def _synthesize_espeak(language: str, text: str, cancel: Event | None) -> AudioClip:
     """Synthesize and encode PCM while translating library errors."""
-    _check_synthesis_cancel(cancel)
-    capture = _EspeakCapture(cancel)
+    _raise_if_cancelled(cancel)
     try:
         with _ESPEAK_SYNTHESIS_LOCK:
-            return _encode_pcm(*_run_espeak_synthesis(language, text, capture))
+            return _encode_pcm(*_run_espeak_synthesis(language, text, cancel))
     except (PlaybackCancelledError, TtsError):
         raise
     except (OSError, RuntimeError, SystemError, TypeError, ValueError, wave.Error) as err:
-        capture.raise_if_failed()
         raise TtsError("Speech engine failed to synthesize audio.") from err
 
 
 class EspeakEngine:
     """Synthesize speech synchronously via the local eSpeak NG library."""
 
-    def __init__(self, voice: str = "de", binary: str = "espeak-ng", language: str | None = None) -> None:
-        """Select a language or voice while retaining the legacy binary argument."""
-        del binary
-        self._source: str = "espeak-ng"
-        self._language: str = _normalize_tts_language(voice if language is None else language)
+    def __init__(self, language: str = "de") -> None:
+        """Select an eSpeak language or voice."""
+        self._language: str = _normalize_tts_language(language)
 
     @property
     def source(self) -> str:
         """Return the eSpeak NG library source name."""
-        return self._source
+        return "espeak-ng"
 
     @property
     def language(self) -> str:
         """Return the selected eSpeak language or voice."""
         return self._language
-
-    def synthesize(self, text: str) -> AudioClip:
-        """Synthesize eSpeak audio and return a validated WAV clip."""
-        return self.synthesize_cancellable(text, None)
 
     def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
         """Synthesize eSpeak audio with callback-based cancellation and bounds."""
@@ -484,7 +382,7 @@ def _response_audio(sock: socket.socket, response: HTTPResponse, deadline: float
     data = _read_http_body(sock, response, deadline)
     if expected is not None and len(data) != expected:
         raise TtsError("Incomplete speech response.")
-    return _tts_clip(data)
+    return AudioClip(data)
 
 
 class _HttpCall:
@@ -497,12 +395,12 @@ class _HttpCall:
 
     def run(self, cancel: Event | None = None) -> AudioClip:
         """Return the clip; cancellation is checked before and after the blocking request."""
-        _check_synthesis_cancel(cancel)
+        _raise_if_cancelled(cancel)
         try:
             clip = self._send()
         except (HTTPException, OSError, ValueError) as err:
             raise TtsError(str(err)) from err
-        _check_synthesis_cancel(cancel)
+        _raise_if_cancelled(cancel)
         return clip
 
     def _send(self) -> AudioClip:
@@ -557,12 +455,8 @@ class HttpEngine:
         path = self._url.path or "/"
         return f"{path}?{self._url.query}" if self._url.query else path
 
-    def synthesize(self, text: str) -> AudioClip:
-        """POST the utterance to the speech endpoint and return a WAV clip within the total deadline."""
-        return self.synthesize_cancellable(text, None)
-
     def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
-        """POST the utterance with cancellation support."""
+        """POST the utterance and return a WAV clip within the total deadline, with cancellation support."""
         body = json.dumps({"text": text, "language": self._language}).encode()
         return _HttpCall(self._url, self._target(), body, self._headers()).run(cancel)
 
@@ -579,34 +473,27 @@ def create_tts_engine(source: str, language: str = "de") -> EspeakEngine | HttpE
     raise TtsError("Unsupported speech engine source.")
 
 
-def _engine_source(engine: TtsEngine | None) -> str:
-    """Describe an engine the way set_tts_source accepts it; custom engines fall back to their class name."""
-    if engine is None:
-        return "espeak-ng"
-    return getattr(engine, "source", type(engine).__name__)
-
-
 class SoundDevicePlayer:
-    """Play clips synchronously through the default or selected PortAudio output."""
+    """Play clips synchronously through the default PortAudio output."""
 
-    def __init__(self, device: str | int | None = None) -> None:
-        """Use the default output device unless a device name or index is supplied."""
-        self._device: str | int | None = device
+    def __init__(self) -> None:
+        """Use the system's default output device."""
         self._lock: Lock = Lock()
         self._start_lock: Lock = Lock()
         self._active: _ActivePlayback | None = None
 
-    def _create_stream(self, channels: int, rate: int) -> _ActivePlayback:
+    def _create_stream(self, channels: int, rate: int, sample_width: int) -> _ActivePlayback:
         """Create an inactive raw output stream."""
+        dtype = "uint8" if sample_width == 1 else f"int{sample_width * 8}"
         try:
-            stream = sounddevice.RawOutputStream(samplerate=rate, device=self._device, channels=channels, dtype="int16")
+            stream = sounddevice.RawOutputStream(samplerate=rate, channels=channels, dtype=dtype)
         except _AUDIO_BACKEND_ERRORS as err:
             raise AudioDeviceError("Cannot open audio output stream.") from err
         return _ActivePlayback(stream)
 
-    def _open_stream(self, channels: int, rate: int) -> _ActivePlayback:
+    def _open_stream(self, channels: int, rate: int, sample_width: int) -> _ActivePlayback:
         """Open and start an output stream with the WAV clip's sample format."""
-        active = self._create_stream(channels, rate)
+        active = self._create_stream(channels, rate, sample_width)
         try:
             active.stream.start()
         except _AUDIO_BACKEND_ERRORS as err:
@@ -623,10 +510,8 @@ class SoundDevicePlayer:
 
     def _close_after_failure(self, active: _ActivePlayback) -> None:
         """Best-effort cleanup that preserves the original stream failure."""
-        try:
+        with suppress(*_AUDIO_BACKEND_ERRORS):
             active.stream.close()
-        except _AUDIO_BACKEND_ERRORS:
-            pass
 
     def _finish_stream(self, active: _ActivePlayback, *, drain: bool) -> None:
         """Drain or abort a stream and translate backend failures."""
@@ -647,14 +532,14 @@ class SoundDevicePlayer:
         if previous is not None:
             previous.finished.wait()
 
-    def _start(self, channels: int, rate: int, cancel: Event | None) -> _ActivePlayback | None:
+    def _start(self, channels: int, rate: int, sample_width: int, cancel: Event | None) -> _ActivePlayback | None:
         """Abort an existing output and start a replacement unless cancelled."""
         with self._start_lock:
             self._replace_active()
             with self._lock:
                 if cancel is not None and cancel.is_set():
                     return None
-                active = self._open_stream(channels, rate)
+                active = self._open_stream(channels, rate, sample_width)
                 self._active = active
                 return active
 
@@ -663,9 +548,9 @@ class SoundDevicePlayer:
         with self._lock:
             return active.stopped or (cancel is not None and cancel.is_set())
 
-    def _write(self, active: _ActivePlayback, channels: int, frames: bytes, cancel: Event | None) -> bool:
+    def _write(self, active: _ActivePlayback, channels: int, sample_width: int, frames: bytes, cancel: Event | None) -> bool:
         """Write frame-aligned chunks and return whether all frames were submitted."""
-        chunk_bytes = OUTPUT_CHUNK_FRAMES * channels * 2
+        chunk_bytes = OUTPUT_CHUNK_FRAMES * channels * sample_width
         for offset in range(0, len(frames), chunk_bytes):
             if self._interrupted(active, cancel):
                 return False
@@ -696,16 +581,18 @@ class SoundDevicePlayer:
                 self._active = None
             active.finished.set()
 
-    def _capture_write(self, active: _ActivePlayback, channels: int, frames: bytes, cancel: Event | None) -> tuple[bool, BaseException | None]:
+    def _capture_write(
+        self, active: _ActivePlayback, channels: int, sample_width: int, frames: bytes, cancel: Event | None
+    ) -> tuple[bool, BaseException | None]:
         """Write output while retaining any failure for cleanup and re-raise."""
         try:
-            return self._write(active, channels, frames, cancel), None
+            return self._write(active, channels, sample_width, frames, cancel), None
         except BaseException as err:
             return False, err
 
-    def _play_active(self, active: _ActivePlayback, channels: int, frames: bytes, cancel: Event | None) -> None:
+    def _play_active(self, active: _ActivePlayback, channels: int, sample_width: int, frames: bytes, cancel: Event | None) -> None:
         """Write, then drain or abort and close the stream, all on the playing thread."""
-        completed, failure = self._capture_write(active, channels, frames, cancel)
+        completed, failure = self._capture_write(active, channels, sample_width, frames, cancel)
         try:
             self._finalize_stream(active, drain=completed and not self._interrupted(active, cancel))
         except AudioDeviceError as err:
@@ -717,12 +604,13 @@ class SoundDevicePlayer:
 
     def play(self, clip: AudioClip, cancel: Event | None = None) -> None:
         """Play a WAV clip synchronously; return quietly if cancelled or stopped."""
-        channels, rate, frames = _read_pcm(clip.wav_bytes)
-        active = self._start(channels, rate, cancel)
+        channels, rate, sample_width, frames = _read_pcm(clip.wav_bytes)
+        active = self._start(channels, rate, sample_width, cancel)
         if active is not None:
             # PortAudio's ALSA backend drops buffered frames on stop, so push the clip's tail out with silence.
-            padding = bytes(math.ceil(2 * active.stream.latency * rate) * channels * 2)
-            self._play_active(active, channels, frames + padding, cancel)
+            silence = 0x80 if sample_width == 1 else 0
+            padding = bytes([silence]) * (math.ceil(2 * active.stream.latency * rate) * channels * sample_width)
+            self._play_active(active, channels, sample_width, frames + padding, cancel)
 
     def stop(self) -> None:
         """Ask the active playback to abort; the playing thread performs the PortAudio calls."""
@@ -731,38 +619,30 @@ class SoundDevicePlayer:
                 self._active.stopped = True
 
 
-def _check_volume(value: int, limits: tuple[int, int]) -> None:
-    """Reject non-integer percentages and values outside the inclusive limits."""
-    if type(value) is not int or not limits[0] <= value <= limits[1]:
-        raise VolumeError("Volume must be an integer within the configured limits.")
+def _check_volume(value: int) -> None:
+    """Reject non-integer percentages and values outside 0 to 100."""
+    if type(value) is not int or not 0 <= value <= 100:
+        raise ValueError("Volume must be an integer between 0 and 100.")
+
+
+def _set_system_volume(percent: int) -> None:
+    """Set the PipeWire default output volume via WirePlumber."""
+    try:
+        subprocess.run(
+            ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{percent / 100:.2f}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as err:
+        raise AudioDeviceError("Cannot set system output volume.") from err
 
 
 def _check_priority(priority: int) -> None:
     """Reject priorities that are not non-negative integers."""
     if type(priority) is not int or priority < 0:
-        raise InputValidationError("Priority must be a non-negative integer.")
-
-
-def _custom_synthesis_worker(engine: TtsEngine, text: str, cancel: Event, result: Future[AudioClip]) -> None:
-    """Publish a legacy engine's result or exception to its waiting caller."""
-    try:
-        result.set_result(engine.synthesize(text))
-    except BaseException as err:
-        result.set_exception(err)
-        if cancel.is_set():
-            LOGGER.warning("Custom speech engine failed after cancellation.", exc_info=err)
-
-
-def _custom_synthesis(engine: TtsEngine, text: str, cancel: Event) -> AudioClip:
-    """Wait for a legacy engine without blocking a cancelled caller."""
-    _check_synthesis_cancel(cancel)
-    result: Future[AudioClip] = Future()
-    Thread(target=_custom_synthesis_worker, args=(engine, text, cancel, result), name="tts-custom", daemon=True).start()
-    while not result.done():
-        if cancel.wait(SYNTHESIS_POLL_S):
-            _check_synthesis_cancel(cancel)
-    _check_synthesis_cancel(cancel)
-    return result.result()
+        raise ValueError("Priority must be a non-negative integer.")
 
 
 def _produce_clip(request: _Request, produce: Callable[[_Request], AudioClip]) -> AudioClip:
@@ -770,45 +650,28 @@ def _produce_clip(request: _Request, produce: Callable[[_Request], AudioClip]) -
     try:
         return produce(request)
     except Exception:
-        request.raise_if_cancelled()
+        _raise_if_cancelled(request.cancel)
         raise
 
 
-def _speaker_language(engine: TtsEngine | None, language: str | None) -> str:
-    """Select a language that is compatible with an optional custom engine."""
-    engine_language = getattr(engine, "language", None)
-    if engine_language is not None:
-        engine_language = _normalize_tts_language(engine_language)
-    selected_language = _normalize_tts_language(language if language is not None else engine_language or "de")
-    if engine_language is not None and selected_language != engine_language:
-        raise TtsError("Speaker language does not match the speech engine language.")
-    return selected_language
-
-
 class Speaker:
-    """Synchronous speaker adapter supporting WAV files, TTS, volume limits, priorities and stop.
+    """Synchronous speaker adapter supporting WAV files, TTS, volume, priorities, skip and stop.
 
     Overlapping requests are played one after another: higher priority first, equal priority in order
-    of arrival. A running clip is never preempted by a later request; only stop(), skip() or a lowered
-    volume limit interrupt it, in which case the affected call raises PlaybackCancelledError.
+    of arrival. A running clip is never preempted by a later request; only stop() or skip() interrupt it,
+    in which case the affected call raises PlaybackCancelledError.
     """
 
-    def __init__(self, engine: TtsEngine | None = None, player: AudioPlayer | None = None, language: str | None = None) -> None:
-        """Use eSpeak NG and the default PortAudio output, resolving eSpeak on first speech call.
-
-        Raises:
-            TtsError: ``language`` differs from the language of the given ``engine``.
-        """
-        self._source, self._language = _engine_source(engine), _speaker_language(engine, language)
+    def __init__(self, engine: TtsEngine | None = None) -> None:
+        """Use German eSpeak NG and the default PortAudio output."""
+        self._source, self._language = ("espeak-ng", "de") if engine is None else (engine.source, engine.language)
         self._engine: TtsEngine | None = engine
-        self._player: AudioPlayer = SoundDevicePlayer() if player is None else player
+        self._player: SoundDevicePlayer = SoundDevicePlayer()
         self._lock: Lock = Lock()
         self._turn: Condition = Condition(self._lock)
         self._queue: list[_Request] = []
         self._next_seq: int = 0
         self._active: _Request | None = None
-        self._active_volume: int | None = None
-        self._limits: tuple[int, int] = (0, 100)
         self._volume: int = 50
 
     def _resolve_engine(self) -> TtsEngine:
@@ -838,31 +701,17 @@ class Speaker:
         """Block until the request may play and claim the output; raise PlaybackCancelledError if it was cancelled."""
         with self._turn:
             self._turn.wait_for(lambda: request.cancel.is_set() or self._is_next(request))
-            request.raise_if_cancelled()
+            _raise_if_cancelled(request.cancel)
             self._active = request
-
-    def _prepare(self, request: _Request, clip: AudioClip) -> AudioClip:
-        """Scale the clip outside the lock and commit its volume if it still respects the maximum limit."""
-        with self._lock:
-            volume = self._volume
-        while True:
-            scaled = _scale(clip, volume)
-            with self._lock:
-                request.raise_if_cancelled()
-                if volume <= self._limits[1]:
-                    self._active_volume = volume
-                    return scaled
-                volume = self._volume
 
     def _output(self, request: _Request, clip: AudioClip) -> None:
         """Play the claimed request; raise PlaybackCancelledError if it was cancelled before or during output."""
-        scaled = self._prepare(request, clip)
         try:
-            self._player.play(scaled, request.cancel)
+            self._player.play(clip, request.cancel)
         except AudioDeviceError:
             if not request.cancel.is_set():
                 raise
-        request.raise_if_cancelled()
+        _raise_if_cancelled(request.cancel)
 
     def _release(self, request: _Request) -> None:
         """Remove a finished, failed or cancelled request and wake waiting requests."""
@@ -870,7 +719,7 @@ class Speaker:
             if request in self._queue:
                 self._queue.remove(request)
             if self._active is request:
-                self._active, self._active_volume = None, None
+                self._active = None
             self._turn.notify_all()
 
     def _run(self, priority: int, produce: Callable[[_Request], AudioClip]) -> None:
@@ -885,14 +734,10 @@ class Speaker:
             self._release(request)
 
     def _synthesize(self, request: _Request, text: str) -> AudioClip:
-        """Use an engine's cancellation support or adapt a legacy engine."""
-        request.raise_if_cancelled()
+        """Resolve the engine and synthesize with the request's cancellation event."""
+        _raise_if_cancelled(request.cancel)
         engine = self._resolve_engine()
-        request.raise_if_cancelled()
-        synthesize = getattr(engine, "synthesize_cancellable", None)
-        if callable(synthesize):
-            return synthesize(text, request.cancel)
-        return _custom_synthesis(engine, text, request.cancel)
+        return engine.synthesize_cancellable(text, request.cancel)
 
     def play(self, path: str | Path, priority: int = 0) -> None:
         """Validate and play a local WAV file synchronously.
@@ -902,7 +747,7 @@ class Speaker:
             priority: Non-negative integer; higher values are played first. Defaults to the lowest priority 0.
 
         Raises:
-            PlaybackCancelledError: The clip was cancelled by stop(), skip() or a lowered volume limit; see ``reason``.
+            PlaybackCancelledError: The clip was cancelled by stop() or skip().
         """
         self._run(priority, lambda _: _load_file(path))
 
@@ -914,9 +759,7 @@ class Speaker:
             priority: Non-negative integer; higher values are played first. Defaults to the lowest priority 0.
 
         Raises:
-            PlaybackCancelledError: The speech was cancelled by stop(), skip() or a lowered volume limit; see ``reason``.
-
-        A custom engine without ``synthesize_cancellable(text, cancel)`` may continue running after cancellation.
+            PlaybackCancelledError: The speech was cancelled by stop() or skip().
         """
         cleaned = _clean_text(text)
         self._run(priority, lambda request: self._synthesize(request, cleaned))
@@ -925,7 +768,7 @@ class Speaker:
         """Stop active playback and cancel all queued requests, including those still being prepared."""
         with self._turn:
             for request in self._queue:
-                request.cancel_with(CancelReason.STOPPED)
+                request.cancel.set()
             self._queue.clear()
             try:
                 self._player.stop()
@@ -936,13 +779,12 @@ class Speaker:
         """Stop only the clip that currently owns the output; queued requests continue in order.
 
         Requests that are still waiting or being synthesized are not affected. The skipped say()/play() call raises
-        PlaybackCancelledError with reason SKIPPED.
-
+        PlaybackCancelledError.
         """
         with self._lock:
             if self._active is None:
                 return
-            self._active.cancel_with(CancelReason.SKIPPED)
+            self._active.cancel.set()
             self._player.stop()
 
     def set_tts_source(self, source: str, language: str | None = None) -> None:
@@ -964,41 +806,13 @@ class Speaker:
             return self._language
 
     def set_volume(self, volume_percent: int) -> None:
-        """Set the playback volume percentage for subsequent clips."""
+        """Set the global default output volume percentage."""
+        _check_volume(volume_percent)
         with self._lock:
-            _check_volume(volume_percent, self._limits)
+            _set_system_volume(volume_percent)
             self._volume = volume_percent
 
     def get_volume(self) -> int:
-        """Return the configured playback volume percentage."""
+        """Return the configured global output volume percentage."""
         with self._lock:
             return self._volume
-
-    def _apply_volume_limits_locked(self, min_percent: int, max_percent: int) -> None:
-        """Clamp configured volume while holding the speaker lock."""
-        self._limits = (min_percent, max_percent)
-        self._volume = max(min_percent, min(self._volume, max_percent))
-
-    def _stop_above_limit_locked(self, max_percent: int) -> None:
-        """Stop output above a new maximum while holding the speaker lock."""
-        if self._active is not None and self._active_volume is not None and self._active_volume > max_percent:
-            self._active.cancel_with(CancelReason.VOLUME_LIMIT)
-            self._player.stop()
-
-    def set_volume_limits(self, min_percent: int, max_percent: int) -> None:
-        """Update hearing protection limits, clamping volume and stopping the active clip if it is too loud.
-
-        Queued requests are kept; they are scaled with the clamped volume when it is their turn.
-        """
-        _check_volume(min_percent, (0, 100))
-        _check_volume(max_percent, (min_percent, 100))
-        with self._lock:
-            try:
-                self._stop_above_limit_locked(max_percent)
-            finally:
-                self._apply_volume_limits_locked(min_percent, max_percent)
-
-    def get_volume_limits(self) -> tuple[int, int]:
-        """Return the inclusive minimum and maximum volume percentages."""
-        with self._lock:
-            return self._limits
