@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import signal
 import socket
 import struct
 import subprocess
@@ -55,10 +54,6 @@ class AudioFileError(SpeakerError):
 
 class TtsError(SpeakerError):
     """A speech engine could not be configured or synthesize audio."""
-
-
-class _HttpWorkerCleanupError(TtsError):
-    """A cancelled or timed-out HTTP synthesis worker could not be stopped."""
 
 
 class VolumeError(SpeakerError):
@@ -279,74 +274,6 @@ def _check_synthesis_cancel(cancel: Event | None) -> None:
         raise PlaybackCancelledError(CancelReason.STOPPED)
 
 
-def _communicate_http_worker(process: subprocess.Popen[bytes], data: bytes, cancel: Event | None, deadline: float) -> tuple[bytes, bytes]:
-    """Poll the HTTP synthesis worker while observing cancellation and the total deadline."""
-    pending: bytes | None = data
-    while True:
-        _check_synthesis_cancel(cancel)
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TtsError("Speech engine timed out.")
-        try:
-            return process.communicate(pending, timeout=min(remaining, SYNTHESIS_POLL_S))
-        except subprocess.TimeoutExpired:
-            pending = None
-
-
-def _kill_http_worker(process: subprocess.Popen[bytes]) -> None:
-    """Force-stop an active HTTP synthesis worker without risking a reaped process group."""
-    if os.name == "posix":
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    elif process.poll() is None:
-        process.kill()
-
-
-def _cleanup_http_worker(process: subprocess.Popen[bytes]) -> None:
-    """Stop the HTTP synthesis worker tree and reap it within a bounded cleanup period."""
-    if process.returncode is not None:
-        return
-    try:
-        _kill_http_worker(process)
-        process.communicate(timeout=STOP_TIMEOUT_S)
-    except subprocess.TimeoutExpired as err:
-        raise _HttpWorkerCleanupError("HTTP synthesis worker cleanup timed out.") from err
-    except (OSError, ValueError, subprocess.SubprocessError) as err:
-        raise _HttpWorkerCleanupError("Could not stop HTTP synthesis worker.") from err
-
-
-def _http_worker_result(process: subprocess.Popen[bytes], data: bytes, cancel: Event | None, deadline: float) -> bytes:
-    """Collect a successful HTTP worker result or translate its failure."""
-    output, stderr = _communicate_http_worker(process, data, cancel, deadline)
-    _check_synthesis_cancel(cancel)
-    if process.returncode:
-        detail = stderr.decode("utf-8", errors="replace").strip()
-        raise TtsError(f"Speech engine process failed: {detail or process.returncode}")
-    return output
-
-
-def _run_http_worker(command: list[str], data: bytes, cancel: Event | None) -> bytes:
-    """Run a bounded HTTP synthesis worker and reap it on cancellation or timeout."""
-    _check_synthesis_cancel(cancel)
-    deadline = monotonic() + SYNTHESIS_TIMEOUT_S
-    try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=os.name == "posix",
-        )
-        try:
-            return _http_worker_result(process, data, cancel, deadline)
-        finally:
-            _cleanup_http_worker(process)
-    except (OSError, ValueError, subprocess.SubprocessError) as err:
-        raise TtsError("HTTP synthesis worker failed.") from err
-
-
 _ESPEAK_SYNTHESIS_LOCK: Lock = Lock()
 
 
@@ -495,7 +422,7 @@ def _response_audio(sock: socket.socket, response: HTTPResponse, deadline: float
 
 
 class _HttpCall:
-    """Run an HTTP request in a process so DNS and connection attempts can be stopped."""
+    """Send one HTTP synthesis request."""
 
     def __init__(self, url: SplitResult, target: str, body: bytes, headers: dict[str, str]) -> None:
         """Prepare the request."""
@@ -503,19 +430,17 @@ class _HttpCall:
         self._request: tuple[str, bytes, dict[str, str]] = (target, body, headers)
 
     def run(self, cancel: Event | None = None) -> AudioClip:
-        """Return the clip or stop and reap the worker on cancellation or timeout."""
-        target, body, headers = self._request
-        request = json.dumps({"url": self._url.geturl(), "target": target, "body": body.decode(), "headers": headers}).encode()
-        command = [sys.executable, "-I", "-B", str(Path(__file__).resolve()), "--tts-http-worker"]
-        result = _run_http_worker(command, request, cancel)
-        if not result:
-            raise TtsError("Speech service returned no result.")
-        if result[:1] != b"\x00":
-            raise TtsError(result[1:].decode("utf-8", errors="replace"))
-        return AudioClip(result[1:])
+        """Return the clip; cancellation is checked before and after the blocking request."""
+        _check_synthesis_cancel(cancel)
+        try:
+            clip = self._send()
+        except (HTTPException, OSError, ValueError) as err:
+            raise TtsError(str(err)) from err
+        _check_synthesis_cancel(cancel)
+        return clip
 
     def _send(self) -> AudioClip:
-        """Connect, POST the request and read the validated WAV response within the total deadline."""
+        """Connect, POST the request and read the validated WAV response; DNS lookup is not bounded by the timeout."""
         deadline = monotonic() + SYNTHESIS_TIMEOUT_S
         connection = HTTPSConnection if self._url.scheme == "https" else HTTPConnection
         target, body, headers = self._request
@@ -527,17 +452,6 @@ class _HttpCall:
             client.request("POST", target, body=body, headers=headers)
             with client.getresponse() as response:
                 return _response_audio(sock, response, deadline)
-
-
-def _http_worker() -> None:
-    """Read a private request from stdin and return a tagged result on stdout."""
-    try:
-        request = json.loads(sys.stdin.buffer.read())
-        call = _HttpCall(_endpoint(request["url"]), request["target"], request["body"].encode(), request["headers"])
-        result = b"\x00" + call._send().wav_bytes
-    except (TtsError, HTTPException, OSError, ValueError) as err:
-        result = b"\x01" + str(err).encode("utf-8", errors="replace")
-    sys.stdout.buffer.write(result)
 
 
 class HttpEngine:
@@ -744,11 +658,9 @@ def _custom_synthesis(engine: TtsEngine, text: str, cancel: Event) -> AudioClip:
 
 
 def _produce_clip(request: _Request, produce: Callable[[_Request], AudioClip]) -> AudioClip:
-    """Prefer a cancellation over an ordinary preparation error, but report failed cleanup."""
+    """Prefer a cancellation over an ordinary preparation error."""
     try:
         return produce(request)
-    except _HttpWorkerCleanupError:
-        raise
     except Exception:
         request.raise_if_cancelled()
         raise
@@ -972,7 +884,3 @@ class Speaker:
         """Return the inclusive minimum and maximum volume percentages."""
         with self._lock:
             return self._limits
-
-
-if __name__ == "__main__" and sys.argv[1:] == ["--tts-http-worker"]:
-    _http_worker()
