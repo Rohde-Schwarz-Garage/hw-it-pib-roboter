@@ -2,7 +2,11 @@
 name = "hw-it-pib-roboter"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "numpy>=2.0",
+    "pyusb>=1.2",
+    "sounddevice>=0.5",
+]
 
 [dependency-groups]
 dev = ["ruff"]
