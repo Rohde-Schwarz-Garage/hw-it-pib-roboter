@@ -377,6 +377,38 @@ class SpeechToText(ABC):
         """Convert mono audio to text."""
 
 
+class StreamingSpeechToText(SpeechToText, ABC):
+    """Speech-to-text engine that supports live recognition and WAV files."""
+
+    @abstractmethod
+    def start_session(self, sample_rate_hz: int) -> None:
+        """Start a new live recognition session."""
+
+    @abstractmethod
+    def accept_audio(self, audio: np.ndarray) -> None:
+        """Add a mono audio chunk to the active recognition session."""
+
+    @abstractmethod
+    def get_partial_text(self) -> str:
+        """Return the currently recognized live text."""
+
+    @abstractmethod
+    def finish_session(self) -> str:
+        """Finish the live recognition session and return its final text."""
+
+    @abstractmethod
+    def cancel_session(self) -> None:
+        """Discard the active live recognition session."""
+
+    @abstractmethod
+    def get_detected_language(self) -> str | None:
+        """Return the selected language code, if audio has been recognized."""
+
+    @abstractmethod
+    def transcribe_wav(self, path: Path) -> str:
+        """Transcribe a WAV file and return its text."""
+
+
 class WakeWordDetector(ABC):
     """Pluggable wake-word engine."""
 
@@ -559,6 +591,8 @@ class Microphone:
         self._speech_to_text: SpeechToText | None = speech_to_text
         self._wake_word_detector: WakeWordDetector | None = wake_word_detector
         self._listeners: list[AudioCallback] = []
+        self._live_transcription_engine: StreamingSpeechToText | None = None
+        self._last_transcription_language: str | None = None
 
     def open(self) -> None:
         """Open the USB device and audio backend."""
@@ -571,7 +605,7 @@ class Microphone:
 
     def close(self) -> None:
         """Stop streaming, turn LEDs off and release all devices."""
-        self.stop_listening()
+        self._cancel_live_transcription()
         try:
             self._leds.off()
         except MicrophoneError:
@@ -611,6 +645,58 @@ class Microphone:
         audio = self._recorder.record_until_silence(max_duration_s, silence_timeout_s)
         return speech_to_text.transcribe(audio[:, PROCESSED_CHANNEL], self._backend.config.sample_rate_hz)
 
+    def start_live_transcription(
+        self,
+        english_model_path: Path | None = None,
+        german_model_path: Path | None = None,
+    ) -> None:
+        """Start bilingual live transcription and lazily create the Vosk engine."""
+        if self._live_transcription_engine is not None:
+            raise MicrophoneError("A live transcription session is already active.")
+        self._ensure_not_listening()
+        engine = self._get_streaming_speech_to_text(english_model_path, german_model_path)
+        engine.start_session(self._backend.config.sample_rate_hz)
+        try:
+            self.start_listening(engine.accept_audio)
+        except Exception:
+            engine.cancel_session()
+            raise
+        self._live_transcription_engine = engine
+
+    def get_live_transcription_partial(self) -> str:
+        """Return the provisional text of the active live transcription."""
+        return self._require_live_transcription().get_partial_text()
+
+    def finish_live_transcription(self) -> str:
+        """Stop live capture and return the final bilingual transcript."""
+        engine = self._require_live_transcription()
+        self.stop_listening()
+        try:
+            text = engine.finish_session()
+            self._last_transcription_language = engine.get_detected_language()
+            return text
+        finally:
+            self._live_transcription_engine = None
+
+    def get_live_transcription_language(self) -> str | None:
+        """Return ``en`` or ``de`` for the latest live transcript."""
+        if self._live_transcription_engine is None:
+            return self._last_transcription_language
+        return self._live_transcription_engine.get_detected_language()
+
+    def transcribe_wav(
+        self,
+        path: Path,
+        english_model_path: Path | None = None,
+        german_model_path: Path | None = None,
+    ) -> str:
+        """Transcribe an existing mono PCM WAV file in German or English."""
+        self._ensure_not_listening()
+        engine = self._get_streaming_speech_to_text(english_model_path, german_model_path)
+        text = engine.transcribe_wav(path)
+        self._last_transcription_language = engine.get_detected_language()
+        return text
+
     def get_direction_deg(self) -> int:
         """Return the current direction of arrival in degrees."""
         return self._tuning.get_direction_deg()
@@ -646,6 +732,7 @@ class Microphone:
         """Stream processed audio blocks to ``callback`` in a background thread."""
 
         def forward_processed(block: np.ndarray) -> None:
+            """Forward only the processed channel to the caller."""
             callback(block[:, PROCESSED_CHANNEL])
 
         self._listeners.append(forward_processed)
@@ -670,7 +757,47 @@ class Microphone:
         """Access the LED ring for feedback patterns."""
         return self._leds
 
+    def _get_streaming_speech_to_text(
+        self,
+        english_model_path: Path | None,
+        german_model_path: Path | None,
+    ) -> StreamingSpeechToText:
+        """Return or lazily create a streaming speech-to-text engine."""
+        speech_to_text = self._speech_to_text
+        if speech_to_text is None:
+            if english_model_path is None or german_model_path is None:
+                raise MicrophoneError("Both English and German Vosk model paths are required.")
+            speech_to_text = self._create_vosk_speech_to_text(english_model_path, german_model_path)
+            self._speech_to_text = speech_to_text
+        if not isinstance(speech_to_text, StreamingSpeechToText):
+            raise MicrophoneError("The configured speech-to-text engine does not support streaming or WAV transcription.")
+        return speech_to_text
+
+    @staticmethod
+    def _create_vosk_speech_to_text(english_model_path: Path, german_model_path: Path) -> StreamingSpeechToText:
+        """Import and construct the bilingual Vosk engine."""
+        try:
+            from .vosk_speech_to_text import VoskSpeechToText
+        except ImportError as error:
+            raise MicrophoneError("Vosk speech recognition is not installed.") from error
+        return VoskSpeechToText(english_model_path, german_model_path)
+
+    def _require_live_transcription(self) -> StreamingSpeechToText:
+        """Return the active live engine or raise an error."""
+        if self._live_transcription_engine is None:
+            raise MicrophoneError("No live transcription session is active.")
+        return self._live_transcription_engine
+
+    def _cancel_live_transcription(self) -> None:
+        """Stop and discard the current live transcription session."""
+        engine = self._live_transcription_engine
+        self.stop_listening()
+        if engine is not None:
+            engine.cancel_session()
+            self._live_transcription_engine = None
+
     def _ensure_not_listening(self) -> None:
+        """Raise when the audio stream is already in use."""
         # The backend has a single reader; parallel reads would split the audio between consumers.
         if self._stream.is_running:
             raise MicrophoneError("Stop listening before recording; the audio stream is in use.")
