@@ -3,7 +3,7 @@ name = "hw-it-pib-roboter"
 version = "0.0.0"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["tinkerforge>=2.1.32"]
+dependencies = ["tinkerforge>=2.1.32", "espeakng", "piper-tts", "sounddevice"]
 
 [project.optional-dependencies]
 dev = ["ruff"]
