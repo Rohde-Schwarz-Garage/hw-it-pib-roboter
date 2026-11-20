@@ -3,14 +3,13 @@ name = "hw-it-pib-roboter"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "numpy>=2.0",
     "pyusb>=1.2",
     "sounddevice>=0.5",
     "vosk>=0.3.45",
 ]
 
 [dependency-groups]
-dev = ["ruff"]
+dev = ["ruff", "numpy"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
