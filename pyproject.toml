@@ -6,6 +6,7 @@ dependencies = [
     "numpy>=2.0",
     "pyusb>=1.2",
     "sounddevice>=0.5",
+    "vosk>=0.3.45",
 ]
 
 [dependency-groups]
