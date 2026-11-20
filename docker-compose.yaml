@@ -138,6 +138,13 @@ services:
       - pib-network
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # needs HOST_UID="$(id -u)"
+    environment:
+      XDG_RUNTIME_DIR: "/run/user/${HOST_UID}"
+      PULSE_SERVER: "unix:/run/user/${HOST_UID}/pulse/native"
+    volumes:
+      - "/run/user/${HOST_UID}/pipewire-0:/run/user/${HOST_UID}/pipewire-0"
+      - "/run/user/${HOST_UID}/pulse/native:/run/user/${HOST_UID}/pulse/native"
 
 volumes:
   programs:
