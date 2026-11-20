@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import subprocess
-import sys
 import unicodedata
 import wave
 from collections.abc import Callable
@@ -12,24 +11,18 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from threading import Condition, Event, Lock
-from time import monotonic
 from typing import Protocol
 
-import espeakng
 import sounddevice
 
-MAX_AUDIO_SIZE_BYTES: int = 50 * 1024 * 1024
+from .tts import AudioClip, SpeakerError, TtsEngine, create_tts_engine
+from .tts.common import MAX_AUDIO_SIZE_BYTES, raise_if_cancelled
+
 MAX_TEXT_LENGTH: int = 500
-SYNTHESIS_TIMEOUT_S: float = 15.0
 OUTPUT_CHUNK_FRAMES: int = 1024
 INVISIBLE_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cf", "Cs"})
 _AUDIO_BACKEND_ERRORS: tuple[type[Exception], ...] = (OSError, RuntimeError, TypeError, ValueError, sounddevice.PortAudioError)
-
-
-class SpeakerError(Exception):
-    """Base error for speaker operations."""
 
 
 class AudioDeviceError(SpeakerError):
@@ -38,39 +31,6 @@ class AudioDeviceError(SpeakerError):
 
 class AudioFileError(SpeakerError):
     """Audio input is inaccessible or not a supported WAV file."""
-
-
-class TtsError(SpeakerError):
-    """A speech engine could not be configured or synthesize audio."""
-
-
-class PlaybackCancelledError(SpeakerError):
-    """A request was cancelled on purpose by stop() or skip() before it completed."""
-
-
-@dataclass(frozen=True)
-class AudioClip:
-    """A complete WAV stream containing PCM audio."""
-
-    wav_bytes: bytes
-
-
-class TtsEngine(Protocol):
-    """Convert plain text to playable audio with cooperative cancellation."""
-
-    @property
-    def source(self) -> str:
-        """Return the source identifier accepted by create_tts_engine()."""
-        ...
-
-    @property
-    def language(self) -> str:
-        """Return the synthesis language."""
-        ...
-
-    def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
-        """Synthesize one utterance, raising PlaybackCancelledError once ``cancel`` is set."""
-        ...
 
 
 class _OutputStream(Protocol):
@@ -137,15 +97,6 @@ def _read_pcm(data: bytes) -> tuple[int, int, int, bytes]:
     return channels, rate, sample_width, frames
 
 
-def _encode_pcm(channels: int, rate: int, frames: bytes) -> AudioClip:
-    """Write a canonical WAV header matching the actual PCM frame count."""
-    with BytesIO() as output:
-        with wave.open(output, "wb") as writer:
-            writer.setparams((channels, 2, rate, 0, "NONE", "not compressed"))
-            writer.writeframes(frames)
-        return AudioClip(output.getvalue())
-
-
 def _load_file(path: str | Path) -> AudioClip:
     """Read and validate a bounded regular local .wav file."""
     try:
@@ -179,246 +130,9 @@ def _clean_text(text: str) -> str:
     return cleaned
 
 
-def _normalize_tts_language(language: str) -> str:
-    """Validate and normalize an eSpeak language."""
-    if not isinstance(language, str):
-        raise TtsError("Invalid speech language.")
-    normalized = language.strip()
-    if not normalized or normalized.startswith("-"):
-        raise TtsError("Invalid speech language.")
-    return normalized
-
-
 def _raise_if_cancelled(cancel: Event | None) -> None:
     """Raise PlaybackCancelledError if the request has been cancelled."""
-    if cancel is not None and cancel.is_set():
-        raise PlaybackCancelledError("Playback cancelled.")
-
-
-_ESPEAK_SYNTHESIS_LOCK: Lock = Lock()
-
-
-@dataclass
-class _EspeakRuntime:
-    """Process-wide eSpeak voice list; only touched while _ESPEAK_SYNTHESIS_LOCK is held."""
-
-    voices: tuple[str, ...] = ()
-
-
-_ESPEAK_RUNTIME: _EspeakRuntime = _EspeakRuntime()
-
-
-def _initialize_espeak() -> _EspeakRuntime:
-    """Cache the voice list exposed by the espeakng wrapper."""
-    if not _ESPEAK_RUNTIME.voices:
-        _ESPEAK_RUNTIME.voices = tuple(voice.lower() for voice in espeakng.Speaker.list_voices())
-    return _ESPEAK_RUNTIME
-
-
-def _espeak_voice_known(voices: tuple[str, ...], language: str) -> bool:
-    """Check a language against the voice codes exposed by espeakng."""
-    base = language.split("+", 1)[0].lower()
-    if not base or not base.isascii():
-        return False
-    return base in voices
-
-
-def _wait_for_espeak(process: subprocess.Popen[bytes], cancel: Event | None) -> None:
-    """Wait for the eSpeak command while honoring cancellation and the synthesis deadline."""
-    deadline = monotonic() + SYNTHESIS_TIMEOUT_S
-    while True:
-        _raise_if_cancelled(cancel)
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            raise TtsError("Speech engine timed out.")
-        try:
-            if process.wait(timeout=min(remaining, 0.05)) != 0:
-                raise TtsError("Speech engine failed to synthesize audio.")
-            return
-        except subprocess.TimeoutExpired:
-            continue
-
-
-def _terminate_espeak(process: subprocess.Popen[bytes]) -> None:
-    """Terminate a still-running eSpeak command and reap it."""
-    if process.poll() is None:
-        with suppress(OSError):
-            process.terminate()
-        try:
-            process.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            with suppress(OSError):
-                process.kill()
-            process.wait()
-
-
-def _read_espeak_frames(reader: wave.Wave_read) -> tuple[int, bytes]:
-    """Read bounded mono 16-bit PCM from an opened eSpeak WAV file."""
-    channels, rate, sample_width = reader.getnchannels(), reader.getframerate(), reader.getsampwidth()
-    if channels != 1 or sample_width != 2 or reader.getnframes() * channels * sample_width > MAX_AUDIO_SIZE_BYTES:
-        raise TtsError("Speech engine output exceeds the size limit or has an invalid format.")
-    frames = reader.readframes(reader.getnframes() + 1)
-    if not frames or len(frames) % 2:
-        raise TtsError("Speech engine returned invalid audio.")
-    return rate, frames
-
-
-def _read_espeak_output(path: Path) -> tuple[int, bytes]:
-    """Read bounded mono 16-bit PCM written by the eSpeak command."""
-    try:
-        with wave.open(str(path), "rb") as reader:
-            return _read_espeak_frames(reader)
-    except TtsError:
-        raise
-    except (wave.Error, EOFError, OSError, ValueError, RuntimeError) as err:
-        raise TtsError("Speech engine returned invalid audio.") from err
-
-
-def _run_espeak_command(language: str, text: str, output_path: Path, cancel: Event | None) -> None:
-    """Run the wrapper-generated WAV export command with cancellation and timeout checks."""
-    command = espeakng.Speaker(voice=language).generate_command(text, export_path=str(output_path))
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        _wait_for_espeak(process, cancel)
-    finally:
-        _terminate_espeak(process)
-
-
-def _run_espeak_synthesis(language: str, text: str, cancel: Event | None) -> tuple[int, int, bytes]:
-    """Run one WAV-exporting eSpeak command while its global state is locked."""
-    runtime = _initialize_espeak()
-    if not _espeak_voice_known(runtime.voices, language):
-        raise TtsError("Speech engine could not select the configured language.")
-    _raise_if_cancelled(cancel)
-    with TemporaryDirectory() as output_directory:
-        output_path = Path(output_directory) / "speech.wav"
-        _run_espeak_command(language, text, output_path, cancel)
-        rate, frames = _read_espeak_output(output_path)
-    return 1, rate, frames
-
-
-def _synthesize_espeak(language: str, text: str, cancel: Event | None) -> AudioClip:
-    """Synthesize and encode PCM while translating library errors."""
-    _raise_if_cancelled(cancel)
-    try:
-        with _ESPEAK_SYNTHESIS_LOCK:
-            return _encode_pcm(*_run_espeak_synthesis(language, text, cancel))
-    except (PlaybackCancelledError, TtsError):
-        raise
-    except (OSError, RuntimeError, SystemError, TypeError, ValueError, wave.Error) as err:
-        raise TtsError("Speech engine failed to synthesize audio.") from err
-
-
-class EspeakEngine:
-    """Synthesize speech synchronously via the local eSpeak NG library."""
-
-    def __init__(self, language: str = "de") -> None:
-        """Select an eSpeak language or voice."""
-        self._language: str = _normalize_tts_language(language)
-
-    @property
-    def source(self) -> str:
-        """Return the eSpeak NG library source name."""
-        return "espeak-ng"
-
-    @property
-    def language(self) -> str:
-        """Return the selected eSpeak language or voice."""
-        return self._language
-
-    def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
-        """Synthesize eSpeak audio with callback-based cancellation and bounds."""
-        return _synthesize_espeak(self._language, text, cancel)
-
-
-def _piper_model_matches(path: Path, language: str, model: str | None) -> bool:
-    """Match a standard Piper voice name against the requested language and model."""
-    locale = path.stem.split("-", 1)[0].lower()
-    requested = language.replace("-", "_").lower()
-    language_matches = locale == requested or ("_" not in requested and locale.startswith(requested + "_"))
-    return language_matches and (model is None or model in {path.stem, path.name})
-
-
-def _select_piper_model(directory: str | Path | None, language: str, model: str | None) -> Path:
-    """Select exactly one complete Piper voice from a directory."""
-    if directory is None:
-        raise TtsError("Piper requires a model directory.")
-    try:
-        folder = Path(directory).resolve(strict=True)
-        if not folder.is_dir():
-            raise TtsError("Piper model path must be a directory.")
-        return _find_piper_model(folder, language, model)
-    except (OSError, RuntimeError, TypeError, ValueError) as err:
-        raise TtsError("Cannot read Piper model directory.") from err
-
-
-def _find_piper_model(folder: Path, language: str, model: str | None) -> Path:
-    """Find one matching model and verify its companion configuration exists."""
-    if model is not None and (not isinstance(model, str) or not model):
-        raise TtsError("Invalid Piper model name.")
-    matches = [path for path in folder.glob("*.onnx") if path.is_file() and _piper_model_matches(path, language, model)]
-    if len(matches) != 1:
-        raise TtsError("Piper requires exactly one matching model; specify a model name if needed.")
-    if not Path(str(matches[0]) + ".json").is_file():
-        raise TtsError("Piper model configuration file is missing.")
-    return matches[0]
-
-
-def _run_piper(model: Path, text: str, output_directory: str, cancel: Event | None) -> AudioClip:
-    """Run Piper in a cancellable process and return validated WAV audio."""
-    output_path = Path(output_directory) / "speech.wav"
-    input_path = Path(output_directory) / "input.txt"
-    input_path.write_text(text, encoding="utf-8")
-    command = [sys.executable, "-m", "piper", "--model", str(model), "--output-file", str(output_path), "--input-file", str(input_path)]
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        _wait_for_espeak(process, cancel)
-    finally:
-        _terminate_espeak(process)
-    rate, frames = _read_espeak_output(output_path)
-    return _encode_pcm(1, rate, frames)
-
-
-class PiperEngine:
-    """Synthesize speech using a local Piper voice."""
-
-    def __init__(self, language: str, model_dir: str | Path | None, model: str | None = None) -> None:
-        """Select a Piper voice for the requested language."""
-        self._language: str = _normalize_tts_language(language)
-        self._model: Path = _select_piper_model(model_dir, self._language, model)
-
-    @property
-    def source(self) -> str:
-        """Return the Piper source name."""
-        return "piper"
-
-    @property
-    def language(self) -> str:
-        """Return the selected language."""
-        return self._language
-
-    def synthesize_cancellable(self, text: str, cancel: Event | None) -> AudioClip:
-        """Synthesize a WAV file while honoring cancellation and the deadline."""
-        _raise_if_cancelled(cancel)
-        try:
-            with TemporaryDirectory() as output_directory:
-                return _run_piper(self._model, text, output_directory, cancel)
-        except (PlaybackCancelledError, TtsError):
-            raise
-        except (OSError, RuntimeError, TypeError, ValueError, wave.Error) as err:
-            raise TtsError("Speech engine failed to synthesize audio.") from err
-
-
-def create_tts_engine(source: str, language: str = "de", model_dir: str | Path | None = None, model: str | None = None) -> TtsEngine:
-    """Create a speech engine from a source identifier and language."""
-    if not isinstance(source, str):
-        raise TtsError("Speech engine source must be a string.")
-    normalized = source.strip().lower()
-    if normalized == "espeak-ng":
-        return EspeakEngine(language=language)
-    if normalized == "piper":
-        return PiperEngine(language, model_dir, model)
-    raise TtsError("Unsupported speech engine source.")
+    raise_if_cancelled(cancel)
 
 
 class SoundDevicePlayer:
