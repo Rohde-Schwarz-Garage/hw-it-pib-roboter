@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import sounddevice as sd
@@ -54,6 +55,7 @@ _LED_BRIGHTNESS: int = 0x20
 _logger: logging.Logger = logging.getLogger(__name__)
 
 AudioCallback = Callable[[np.ndarray], None]
+Language = Literal["en", "de"]
 
 
 class MicrophoneError(Exception):
@@ -480,8 +482,8 @@ class StreamingSpeechToText(SpeechToText, ABC):
     """
 
     @abstractmethod
-    def start_session(self, sample_rate_hz: int) -> None:
-        """Start a new live recognition session."""
+    def start_session(self, sample_rate_hz: int, language: Language) -> None:
+        """Start a new live recognition session in the selected language."""
 
     @abstractmethod
     def accept_audio(self, audio: np.ndarray) -> None:
@@ -965,8 +967,10 @@ class Microphone:
         english_model_path: Path | None = None,
         german_model_path: Path | None = None,
         on_utterance: UtteranceCallback | None = None,
+        *,
+        language: Language,
     ) -> None:
-        """Start bilingual live transcription of the processed channel in the background.
+        """Start live transcription of the processed channel in the selected language.
 
         The Vosk engine is created lazily from the model paths unless a streaming engine was configured.
 
@@ -975,15 +979,19 @@ class Microphone:
             german_model_path: Vosk German model directory; required only if no engine is configured.
             on_utterance: Called with each finished utterance on the audio thread; it must return quickly.
                 Its exceptions are logged and ignored. Without it, poll ``pop_live_utterances``.
+            language: Language to recognize, either ``"en"`` or ``"de"``.
 
         Raises:
+            ValueError: If the language is not ``"en"`` or ``"de"``.
             MicrophoneError: If the microphone is not open, is already streaming, or the engine cannot be
                 created or started. Nothing is left running in that case.
         """
+        if language not in ("en", "de"):
+            raise ValueError(f"Unsupported transcription language: {language!r}; expected 'en' or 'de'.")
         with self._lifecycle_lock:
             self._ensure_ready_to_record()
             engine = self._get_streaming_speech_to_text(english_model_path, german_model_path)
-            self._start_live_session(_LiveSession(engine, self._stream, on_utterance))
+            self._start_live_session(_LiveSession(engine, self._stream, on_utterance), language)
 
     def get_live_transcription_partial(self) -> str:
         """Return the provisional text of the utterance currently being spoken.
@@ -1163,9 +1171,9 @@ class Microphone:
         except Exception as error:
             raise MicrophoneError(f"Could not create the Vosk speech-to-text engine: {error}") from error
 
-    def _start_live_session(self, session: _LiveSession) -> None:
+    def _start_live_session(self, session: _LiveSession, language: Language) -> None:
         """Start the engine session and feed it from the audio stream, rolling back fully on failure."""
-        session.engine.start_session(self._backend.config.sample_rate_hz)
+        session.engine.start_session(self._backend.config.sample_rate_hz, language)
         self._live_session = session
         try:
             self.start_listening(session.accept_block)

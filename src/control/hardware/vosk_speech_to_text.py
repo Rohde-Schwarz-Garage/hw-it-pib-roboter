@@ -9,14 +9,12 @@ import wave
 from collections import deque
 from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
 from vosk import KaldiRecognizer, Model
 
-from control.hardware.microphone import MicrophoneError, StreamingSpeechToText, Utterance
+from control.hardware.microphone import Language, MicrophoneError, StreamingSpeechToText, Utterance
 
-Language = Literal["en", "de"]
 _WAV_CHUNK_FRAMES: int = 8000
 _logger: logging.Logger = logging.getLogger(__name__)
 
@@ -24,8 +22,8 @@ _logger: logging.Logger = logging.getLogger(__name__)
 class VoskSpeechToText(StreamingSpeechToText):
     """Recognize English and German utterances with two local Vosk models.
 
-    Both models hear the same audio. When either one detects the end of an utterance, both are
-    finalized together, and the result with the higher mean word confidence becomes the utterance.
+    Live sessions use one explicitly selected language. One-shot transcription uses both models;
+    when either detects an endpoint, both are finalized and the more confident result is selected.
     All methods are thread-safe.
     """
 
@@ -91,21 +89,24 @@ class VoskSpeechToText(StreamingSpeechToText):
         except (wave.Error, EOFError) as error:
             raise MicrophoneError(f"Invalid WAV file {wav_path}: {error}") from error
 
-    def start_session(self, sample_rate_hz: int) -> None:
+    def start_session(self, sample_rate_hz: int, language: Language) -> None:
         """Start a live session.
 
         Args:
             sample_rate_hz: Sample rate of the audio passed to ``accept_audio``.
+            language: Language to recognize, either ``"en"`` or ``"de"``.
 
         Raises:
-            ValueError: If ``sample_rate_hz`` is not positive.
+            ValueError: If ``sample_rate_hz`` is not positive or the language is unsupported.
             MicrophoneError: If a session is already active.
         """
+        if language not in ("en", "de"):
+            raise ValueError(f"Unsupported transcription language: {language!r}; expected 'en' or 'de'.")
         with self._lock:
-            self._start_session(sample_rate_hz)
+            self._start_session(sample_rate_hz, language)
 
     def accept_audio(self, audio: np.ndarray) -> None:
-        """Feed a chunk to both recognizers; an utterance is queued when one of them detects its end.
+        """Feed the active recognizers; an utterance is queued when one detects its end.
 
         Args:
             audio: One-dimensional int16 PCM samples.
@@ -121,7 +122,7 @@ class VoskSpeechToText(StreamingSpeechToText):
         """Return the provisional text of the utterance currently being spoken.
 
         Returns:
-            The partial transcript with more words, or an empty string.
+            The selected language's partial transcript, or an empty string.
 
         Raises:
             MicrophoneError: If no session is active.
@@ -172,18 +173,22 @@ class VoskSpeechToText(StreamingSpeechToText):
                 raise
             return self._finish_session()
 
-    def _start_session(self, sample_rate_hz: int) -> None:
+    def _start_session(self, sample_rate_hz: int, language: Language | None = None) -> None:
         """Create fresh recognizers; the caller holds the lock."""
         if self._recognizers:
             raise MicrophoneError("A Vosk recognition session is already active.")
         if sample_rate_hz <= 0:
             raise ValueError(f"sample_rate_hz must be positive, got {sample_rate_hz}.")
-        self._recognizers = {language: _create_recognizer(model, sample_rate_hz) for language, model in self._models.items()}
+        self._recognizers = {
+            model_language: _create_recognizer(model, sample_rate_hz)
+            for model_language, model in self._models.items()
+            if language is None or model_language == language
+        }
         self._pending_utterances.clear()
         self._detected_language = None
 
     def _accept_audio(self, audio: np.ndarray) -> None:
-        """Feed both recognizers; the caller holds the lock."""
+        """Feed the active recognizers; the caller holds the lock."""
         self._require_session()
         _validate_audio(audio)
         frames = np.ascontiguousarray(audio, dtype="<i2").tobytes()
@@ -203,7 +208,7 @@ class VoskSpeechToText(StreamingSpeechToText):
             self._reset_session()
 
     def _queue_utterance(self, payloads: dict[Language, str]) -> None:
-        """Queue the more confident of two simultaneous results, unless both are empty."""
+        """Queue the selected result if it contains text."""
         results = {language: _parse_result(payload) for language, payload in payloads.items()}
         language = self._pick_language({language: _confidence_score(result) for language, result in results.items()})
         text = _result_text(results[language])
@@ -216,6 +221,8 @@ class VoskSpeechToText(StreamingSpeechToText):
 
     def _pick_language(self, scores: dict[Language, float]) -> Language:
         """Return the higher-scoring language; a tie keeps the latest language, then English."""
+        if len(scores) == 1:
+            return next(iter(scores))
         if scores["en"] == scores["de"]:
             return self._detected_language or "en"
         return "en" if scores["en"] > scores["de"] else "de"
